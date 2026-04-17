@@ -10,6 +10,10 @@ This project is a local MCP server that lets Claude control Ableton Live through
   - Destructive action confirmation token
 - MCP tools:
   - `get_connection_info`
+  - `get_last_error`
+  - `get_protocol_diagnostics`
+  - `health_live_test`
+  - `run_smoke_check`
   - `get_endpoint_capabilities`
   - `warmup_write_endpoints`
   - `warmup_report_recommendations`
@@ -26,6 +30,7 @@ This project is a local MCP server that lets Claude control Ableton Live through
   - `execute_action_plan`
   - `get_policy_state`
   - `set_policy_state`
+  - `set_safety_mode`
   - `refresh_state_cache`
   - `subscribe_session_events`
   - `detect_plan_conflicts`
@@ -177,4 +182,6 @@ Use your Claude Desktop MCP config file and add:
 - Use `warmup_report_recommendations` to get explicit override guidance for unresolved write endpoint keys.
 - Startup now auto-retries probe/cache initialization (10 attempts, 3 seconds apart) before falling back to warning mode; the server stays online either way.
 - The destructive confirmation token is `YES_I_UNDERSTAND` (returned by `get_connection_info`).
+- Endpoint selections are persisted to `.ableton-endpoints.json` and reused on restart.
+- Audit logs are written to `logs/audit.jsonl` (best-effort, append-only).
 - If a specific endpoint differs in your AbletonOSC build, update it in `src/index.js`.

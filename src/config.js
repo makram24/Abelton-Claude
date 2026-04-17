@@ -6,14 +6,21 @@ const envSchema = z.object({
   ABLETON_OSC_LISTEN_PORT: z.coerce.number().int().positive().default(11001),
   ABLETON_OSC_TIMEOUT_MS: z.coerce.number().int().positive().default(2000),
   ABLETON_DRY_RUN: z
-    .string()
+    .union([z.string(), z.boolean()])
     .optional()
-    .transform((v) => v === "1" || v === "true")
+    .transform((v) => {
+      if (typeof v === "boolean") return v;
+      return v === "1" || v.toLowerCase() === "true";
+    })
     .default(false),
   ABLETON_REQUIRE_DESTRUCTIVE_CONFIRM: z
-    .string()
+    .union([z.string(), z.boolean()])
     .optional()
-    .transform((v) => v !== "0" && v !== "false")
+    .transform((v) => {
+      if (typeof v === "boolean") return v;
+      const lowered = v.toLowerCase();
+      return lowered !== "0" && lowered !== "false";
+    })
     .default(true)
 });
 

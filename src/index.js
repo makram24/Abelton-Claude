@@ -1,6 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { AbletonOscClient, floatArg, intArg, stringArg } from "./abletonOsc.js";
 import { getConfig } from "./config.js";
 
@@ -23,6 +25,8 @@ let probeSummary = null;
 let startupWarnings = [];
 const STARTUP_RETRY_ATTEMPTS = 10;
 const STARTUP_RETRY_DELAY_MS = 3000;
+const ENDPOINT_SELECTIONS_PATH = path.join(process.cwd(), ".ableton-endpoints.json");
+const AUDIT_LOG_PATH = path.join(process.cwd(), "logs", "audit.jsonl");
 const connectionState = {
   connected: false,
   reconnectAttempts: 0,
@@ -76,6 +80,11 @@ const stateCache = {
   tracks: null,
   pendingConflicts: []
 };
+const protocolDiagnostics = {
+  lastOutgoingAt: null,
+  lastIncomingAt: null,
+  lastRttMs: null
+};
 
 const OSC_ENDPOINT_VARIANTS = {
   renderAudio: ["/live/song/export_audio", "/live/song/render_audio", "/live/song/export"],
@@ -84,6 +93,51 @@ const OSC_ENDPOINT_VARIANTS = {
   deviceLoadPreset: ["/live/device/load_preset", "/live/device/set/preset", "/live/device/load/device_preset"],
   subscribeEvents: ["/live/subscribe", "/live/events/subscribe", "/live/observe"]
 };
+
+function classifyError(error) {
+  const message = String(error?.message ?? error ?? "");
+  if (message.includes("EADDRINUSE")) return "PORT_CONFLICT";
+  if (message.includes("Timeout waiting for OSC response")) return "OSC_TIMEOUT";
+  if (message.includes("Role") && message.includes("not allowed")) return "POLICY_BLOCKED";
+  if (message.includes("Destructive action blocked")) return "DESTRUCTIVE_CONFIRM_REQUIRED";
+  if (message.includes("Unknown or disallowed action")) return "PLAN_ACTION_UNKNOWN";
+  return "UNKNOWN_ERROR";
+}
+
+async function appendAuditLog(entry) {
+  try {
+    await mkdir(path.dirname(AUDIT_LOG_PATH), { recursive: true });
+    await appendFile(AUDIT_LOG_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch {
+    // best effort only
+  }
+}
+
+async function persistEndpointSelections() {
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      endpointSelections: Object.fromEntries(endpointSelections)
+    };
+    await writeFile(ENDPOINT_SELECTIONS_PATH, JSON.stringify(payload, null, 2), "utf8");
+  } catch {
+    // best effort only
+  }
+}
+
+async function loadPersistedEndpointSelections() {
+  try {
+    const raw = await readFile(ENDPOINT_SELECTIONS_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed?.endpointSelections && typeof parsed.endpointSelections === "object") {
+      for (const [k, v] of Object.entries(parsed.endpointSelections)) {
+        if (typeof v === "string" && v.length > 0) endpointSelections.set(k, v);
+      }
+    }
+  } catch {
+    // no persisted file yet
+  }
+}
 
 function textResult(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -122,10 +176,24 @@ async function withMetrics(commandName, handler) {
     metrics.successfulCommands += 1;
     metrics.commandDurationsMs[commandName] =
       (metrics.commandDurationsMs[commandName] ?? 0) + (Date.now() - start);
+    await appendAuditLog({
+      at: new Date().toISOString(),
+      commandName,
+      ok: true,
+      elapsedMs: Date.now() - start
+    });
     return result;
   } catch (error) {
     metrics.failedCommands += 1;
     metrics.lastError = { commandName, message: error.message, at: new Date().toISOString() };
+    await appendAuditLog({
+      at: new Date().toISOString(),
+      commandName,
+      ok: false,
+      errorCode: classifyError(error),
+      error: error.message,
+      elapsedMs: Date.now() - start
+    });
     throw error;
   }
 }
@@ -140,7 +208,11 @@ async function requestAny(candidates, args = []) {
   let lastError;
   for (const candidate of candidates) {
     try {
+      const startedAt = Date.now();
+      protocolDiagnostics.lastOutgoingAt = new Date().toISOString();
       const response = await oscClient.request(candidate, args, candidate);
+      protocolDiagnostics.lastIncomingAt = new Date().toISOString();
+      protocolDiagnostics.lastRttMs = Date.now() - startedAt;
       return { address: candidate, response };
     } catch (error) {
       lastError = error;
@@ -194,6 +266,7 @@ async function selectEndpoint(key, candidates, args = []) {
     );
   }
   endpointSelections.set(key, probe.address);
+  await persistEndpointSelections();
   return probe.address;
 }
 
@@ -273,6 +346,7 @@ function sendPlanRaw(address, args = [], metadata = {}, options = {}) {
       ...metadata
     };
   }
+  protocolDiagnostics.lastOutgoingAt = new Date().toISOString();
   oscClient.send(address, args);
   return { ok: true, address, ...metadata };
 }
@@ -312,6 +386,137 @@ server.registerTool(
       }
     ]
   })
+);
+
+server.registerTool(
+  "get_last_error",
+  {
+    title: "Get Last Error",
+    description: "Return last normalized error details seen by the bridge."
+  },
+  async () =>
+    textResult({
+      lastError: metrics.lastError
+        ? {
+            ...metrics.lastError,
+            errorCode: classifyError({ message: metrics.lastError.message })
+          }
+        : null
+    })
+);
+
+server.registerTool(
+  "get_protocol_diagnostics",
+  {
+    title: "Get Protocol Diagnostics",
+    description: "Return bind ports and last packet/RTT diagnostics."
+  },
+  async () =>
+    textResult({
+      host: config.ABLETON_OSC_HOST,
+      sendPort: config.ABLETON_OSC_SEND_PORT,
+      listenPort: config.ABLETON_OSC_LISTEN_PORT,
+      protocolDiagnostics
+    })
+);
+
+server.registerTool(
+  "health_live_test",
+  {
+    title: "Health Live Test",
+    description: "Run AbletonOSC /live/test endpoint check."
+  },
+  async () =>
+    withMetrics("health_live_test", async () => {
+      const result = await requestAny(["/live/test"], [stringArg("ok")]);
+      return textResult({
+        ok: true,
+        endpoint: result.address,
+        response: parseOscValue(result.response)
+      });
+    })
+);
+
+server.registerTool(
+  "run_smoke_check",
+  {
+    title: "Run Smoke Check",
+    description: "Run one-shot bridge diagnostics for connectivity and basic reads."
+  },
+  async () =>
+    withMetrics("run_smoke_check", async () => {
+      const checks = [];
+      const run = async (name, fn) => {
+        try {
+          const value = await fn();
+          checks.push({ name, ok: true, value });
+        } catch (error) {
+          checks.push({
+            name,
+            ok: false,
+            errorCode: classifyError(error),
+            error: error.message
+          });
+        }
+      };
+
+      await run("live_test", async () => {
+        const res = await requestAny(["/live/test"], [stringArg("ok")]);
+        return { endpoint: res.address, response: parseOscValue(res.response) };
+      });
+      await run("tempo_get", async () => {
+        const res = await requestKnown("tempoGet", ["/live/song/get/tempo", "/live/song/tempo"]);
+        return { endpoint: res.address, tempo: parseOscValue(res.response) };
+      });
+      await run("track_count", async () => {
+        const res = await requestKnown("trackCountGet", [
+          "/live/song/get/num_tracks",
+          "/live/song/get/track_count"
+        ]);
+        return { endpoint: res.address, count: parseOscValue(res.response) };
+      });
+
+      return textResult({
+        ok: checks.every((c) => c.ok),
+        checks,
+        protocolDiagnostics
+      });
+    })
+);
+
+server.registerTool(
+  "set_safety_mode",
+  {
+    title: "Set Safety Mode",
+    description: "Apply policy presets: safe, studio, live-performance.",
+    inputSchema: {
+      mode: z.enum(["safe", "studio", "live-performance"])
+    }
+  },
+  async ({ mode }) =>
+    withMetrics("set_safety_mode", async () => {
+      if (mode === "safe") {
+        policyState.mode = "safe";
+        policyState.blockDestructiveDuringPlayback = true;
+        policyState.requireRoleForDestructive = true;
+        runtimeContext.role = "operator";
+        runtimeContext.performanceMode = false;
+      } else if (mode === "studio") {
+        policyState.mode = "studio";
+        policyState.blockDestructiveDuringPlayback = true;
+        policyState.requireRoleForDestructive = true;
+        runtimeContext.role = "admin";
+        runtimeContext.performanceMode = false;
+      } else {
+        policyState.mode = "live-performance";
+        policyState.blockDestructiveDuringPlayback = true;
+        policyState.requireRoleForDestructive = true;
+        runtimeContext.role = "operator";
+        runtimeContext.performanceMode = true;
+      }
+
+      return textResult({ ok: true, policyState, runtimeContext });
+    })
 );
 
 server.registerTool(
@@ -2465,13 +2670,9 @@ server.registerTool(
     })
 );
 
-async function main() {
-  await oscClient.open();
-  connectionState.connected = true;
-  connectionState.lastReadyAt = new Date().toISOString();
+async function runStartupWarmup() {
   startupWarnings = [];
   let startupReady = false;
-
   for (let attempt = 1; attempt <= STARTUP_RETRY_ATTEMPTS; attempt += 1) {
     let probeError = null;
     let cacheError = null;
@@ -2513,8 +2714,19 @@ async function main() {
       "Startup retries exhausted. Server remains online; use heartbeat/reprobe_endpoints/refresh_state_cache after AbletonOSC is available."
     );
   }
+}
+
+async function main() {
+  await oscClient.open();
+  connectionState.connected = true;
+  connectionState.lastReadyAt = new Date().toISOString();
+  await loadPersistedEndpointSelections();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Do warmup after MCP connect so initialize doesn't time out.
+  runStartupWarmup().catch((error) => {
+    startupWarnings.push(`Background warmup failed: ${error.message}`);
+  });
 }
 
 async function runCapabilityProbe() {

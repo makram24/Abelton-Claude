@@ -44,3 +44,12 @@ test("registers policy and profile tools", async () => {
   assert.match(src, /"warmup_write_endpoints"/);
   assert.match(src, /"warmup_report_recommendations"/);
 });
+
+test("registers health and diagnostics tools", async () => {
+  const src = await source();
+  assert.match(src, /"health_live_test"/);
+  assert.match(src, /"run_smoke_check"/);
+  assert.match(src, /"get_protocol_diagnostics"/);
+  assert.match(src, /"get_last_error"/);
+  assert.match(src, /"set_safety_mode"/);
+});
