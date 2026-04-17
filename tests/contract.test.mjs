@@ -95,4 +95,14 @@ test("registers creative copilot expansion tools", async () => {
   assert.match(src, /"list_template_packs"/);
   assert.match(src, /"run_show_mode_checklist"/);
   assert.match(src, /"configure_external_hooks"/);
+  assert.match(src, /"upsert_arrangement_section"/);
+  assert.match(src, /"list_arrangement_sections"/);
+  assert.match(src, /"export_arrangement_sections"/);
+  assert.match(src, /"import_arrangement_sections"/);
+  assert.match(src, /"save_arrangement_section_profile"/);
+  assert.match(src, /"load_arrangement_section_profile"/);
+  assert.match(src, /"clone_arrangement_section_map"/);
+  assert.match(src, /"list_arrangement_section_profiles"/);
+  assert.match(src, /"delete_arrangement_section_profile"/);
+  assert.match(src, /"delete_arrangement_section"/);
 });

@@ -156,6 +156,16 @@ On startup, the server now performs an endpoint capability probe and selects the
 
 - `compile_musical_intent`
 - `arrangement_intelligence`
+- `upsert_arrangement_section`
+- `list_arrangement_sections`
+- `export_arrangement_sections`
+- `import_arrangement_sections`
+- `save_arrangement_section_profile`
+- `load_arrangement_section_profile`
+- `clone_arrangement_section_map`
+- `list_arrangement_section_profiles`
+- `delete_arrangement_section_profile`
+- `delete_arrangement_section`
 - `run_mix_health_check`
 - `apply_sound_design_macro`
 - `generate_midi_phrase`
@@ -176,6 +186,13 @@ On startup, the server now performs an endpoint capability probe and selects the
 - `list_template_packs`
 - `run_show_mode_checklist`
 - `configure_external_hooks`
+
+Notes on deeper execution:
+
+- `generate_drum_pattern` can now optionally write generated drum MIDI notes to a target clip (`writeToClip=true` with `trackIndex`/`clipIndex`).
+- `arrangement_intelligence` supports section-aware duplication ranges and optional start/end boundary locator creation.
+- `arrangement_intelligence` now resolves saved named sections from memory when available.
+- `run_mix_health_check` now reports per-track volume/pan/mute/solo/arm diagnostics with warning aggregation.
 
 ## Test harness
 
@@ -221,6 +238,8 @@ Use your Claude Desktop MCP config file and add:
 - Startup now auto-retries probe/cache initialization (10 attempts, 3 seconds apart) before falling back to warning mode; the server stays online either way.
 - The destructive confirmation token is `YES_I_UNDERSTAND` (returned by `get_connection_info`).
 - Endpoint selections are persisted to `.ableton-endpoints.json` and reused on restart.
+- Arrangement section memory is persisted to `.ableton-sections.json` and reused on restart.
+- Arrangement section profiles are persisted to `.ableton-section-profiles.json` and reused on restart.
 - Audit logs are written to `logs/audit.jsonl` (best-effort, append-only).
 - Session event cache is in-memory and returned by `get_session_event_cache` (recent 200 events max).
 - Capability profile scaffold is available via `detect_capability_profile`.

@@ -26,6 +26,11 @@ let startupWarnings = [];
 const STARTUP_RETRY_ATTEMPTS = 10;
 const STARTUP_RETRY_DELAY_MS = 3000;
 const ENDPOINT_SELECTIONS_PATH = path.join(process.cwd(), ".ableton-endpoints.json");
+const ARRANGEMENT_SECTIONS_PATH = path.join(process.cwd(), ".ableton-sections.json");
+const ARRANGEMENT_SECTION_PROFILES_PATH = path.join(
+  process.cwd(),
+  ".ableton-section-profiles.json"
+);
 const AUDIT_LOG_PATH = path.join(process.cwd(), "logs", "audit.jsonl");
 const connectionState = {
   connected: false,
@@ -107,6 +112,8 @@ const externalHooks = {
   releaseTrackerEnabled: false,
   backupEnabled: false
 };
+const arrangementSectionMap = new Map();
+const arrangementSectionProfiles = new Map();
 
 const OSC_ENDPOINT_VARIANTS = {
   renderAudio: ["/live/song/export_audio", "/live/song/render_audio", "/live/song/export"],
@@ -155,6 +162,62 @@ async function loadPersistedEndpointSelections() {
       for (const [k, v] of Object.entries(parsed.endpointSelections)) {
         if (typeof v === "string" && v.length > 0) endpointSelections.set(k, v);
       }
+    }
+  } catch {
+    // no persisted file yet
+  }
+}
+
+async function persistArrangementSections() {
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      sections: [...arrangementSectionMap.entries()]
+    };
+    await writeFile(ARRANGEMENT_SECTIONS_PATH, JSON.stringify(payload, null, 2), "utf8");
+  } catch {
+    // best effort only
+  }
+}
+
+async function loadPersistedArrangementSections() {
+  try {
+    const raw = await readFile(ARRANGEMENT_SECTIONS_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    const sections = Array.isArray(parsed?.sections) ? parsed.sections : [];
+    for (const entry of sections) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [key, value] = entry;
+      if (typeof key !== "string" || typeof value !== "object" || value === null) continue;
+      arrangementSectionMap.set(key, value);
+    }
+  } catch {
+    // no persisted file yet
+  }
+}
+
+async function persistArrangementSectionProfiles() {
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      profiles: [...arrangementSectionProfiles.entries()]
+    };
+    await writeFile(ARRANGEMENT_SECTION_PROFILES_PATH, JSON.stringify(payload, null, 2), "utf8");
+  } catch {
+    // best effort only
+  }
+}
+
+async function loadPersistedArrangementSectionProfiles() {
+  try {
+    const raw = await readFile(ARRANGEMENT_SECTION_PROFILES_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    const profiles = Array.isArray(parsed?.profiles) ? parsed.profiles : [];
+    for (const entry of profiles) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [key, value] = entry;
+      if (typeof key !== "string" || typeof value !== "object" || value === null) continue;
+      arrangementSectionProfiles.set(key, value);
     }
   } catch {
     // no persisted file yet
@@ -3297,6 +3360,264 @@ server.registerTool(
 );
 
 server.registerTool(
+  "upsert_arrangement_section",
+  {
+    title: "Upsert Arrangement Section",
+    description: "Save or update a named arrangement section in memory.",
+    inputSchema: {
+      sectionName: z.string().min(1).max(64),
+      startBeats: z.number().min(0),
+      bars: z.number().int().min(1).max(256),
+      notes: z.string().max(500).optional()
+    }
+  },
+  async ({ sectionName, startBeats, bars, notes }) =>
+    withMetrics("upsert_arrangement_section", async () => {
+      const key = normalizeName(sectionName);
+      arrangementSectionMap.set(key, {
+        sectionName,
+        startBeats,
+        bars,
+        lengthBeats: bars * 4,
+        notes: notes ?? null,
+        updatedAt: new Date().toISOString()
+      });
+      await persistArrangementSections();
+      return textResult({ ok: true, section: arrangementSectionMap.get(key) });
+    })
+);
+
+server.registerTool(
+  "list_arrangement_sections",
+  {
+    title: "List Arrangement Sections",
+    description: "List all saved named arrangement sections."
+  },
+  async () =>
+    withMetrics("list_arrangement_sections", async () =>
+      textResult({
+        sections: [...arrangementSectionMap.values()].sort((a, b) => a.startBeats - b.startBeats)
+      })
+    )
+);
+
+server.registerTool(
+  "export_arrangement_sections",
+  {
+    title: "Export Arrangement Sections",
+    description: "Export current arrangement section map as JSON payload.",
+    inputSchema: {
+      includeMeta: z.boolean().optional().default(true)
+    }
+  },
+  async ({ includeMeta }) =>
+    withMetrics("export_arrangement_sections", async () => {
+      const sections = [...arrangementSectionMap.entries()];
+      return textResult({
+        ok: true,
+        exportedAt: new Date().toISOString(),
+        count: sections.length,
+        payload: includeMeta
+          ? {
+              version: 1,
+              source: "ableton-osc-bridge",
+              sections
+            }
+          : { sections }
+      });
+    })
+);
+
+server.registerTool(
+  "import_arrangement_sections",
+  {
+    title: "Import Arrangement Sections",
+    description: "Import arrangement section map from JSON payload.",
+    inputSchema: {
+      payload: z.object({
+        sections: z.array(z.tuple([z.string(), z.record(z.unknown())])).min(1)
+      }),
+      merge: z.boolean().optional().default(true)
+    }
+  },
+  async ({ payload, merge }) =>
+    withMetrics("import_arrangement_sections", async () => {
+      if (!merge) arrangementSectionMap.clear();
+      let imported = 0;
+      for (const [key, raw] of payload.sections) {
+        const sectionName =
+          typeof raw.sectionName === "string" && raw.sectionName.trim().length > 0
+            ? raw.sectionName
+            : key;
+        const startBeats = Number(raw.startBeats ?? 0);
+        const bars = Number(raw.bars ?? 8);
+        const lengthBeats = Number(raw.lengthBeats ?? bars * 4);
+        arrangementSectionMap.set(key, {
+          sectionName,
+          startBeats: Number.isFinite(startBeats) ? startBeats : 0,
+          bars: Number.isFinite(bars) && bars > 0 ? Math.round(bars) : 8,
+          lengthBeats: Number.isFinite(lengthBeats) ? lengthBeats : 32,
+          notes: typeof raw.notes === "string" ? raw.notes : null,
+          updatedAt: new Date().toISOString()
+        });
+        imported += 1;
+      }
+      await persistArrangementSections();
+      return textResult({
+        ok: true,
+        merge,
+        imported,
+        totalSections: arrangementSectionMap.size
+      });
+    })
+);
+
+server.registerTool(
+  "save_arrangement_section_profile",
+  {
+    title: "Save Arrangement Section Profile",
+    description: "Save current in-memory section map to a named profile.",
+    inputSchema: {
+      profileName: z.string().min(1).max(128)
+    }
+  },
+  async ({ profileName }) =>
+    withMetrics("save_arrangement_section_profile", async () => {
+      const key = normalizeName(profileName);
+      arrangementSectionProfiles.set(key, {
+        profileName,
+        savedAt: new Date().toISOString(),
+        sections: [...arrangementSectionMap.entries()]
+      });
+      await persistArrangementSectionProfiles();
+      return textResult({
+        ok: true,
+        profileName,
+        sectionCount: arrangementSectionMap.size
+      });
+    })
+);
+
+server.registerTool(
+  "load_arrangement_section_profile",
+  {
+    title: "Load Arrangement Section Profile",
+    description: "Load a named section profile into active in-memory map.",
+    inputSchema: {
+      profileName: z.string().min(1).max(128),
+      merge: z.boolean().optional().default(false)
+    }
+  },
+  async ({ profileName, merge }) =>
+    withMetrics("load_arrangement_section_profile", async () => {
+      const key = normalizeName(profileName);
+      const profile = arrangementSectionProfiles.get(key);
+      if (!profile) throw new Error(`Unknown arrangement section profile: ${profileName}`);
+      if (!merge) arrangementSectionMap.clear();
+      for (const [sectionKey, sectionValue] of profile.sections) {
+        arrangementSectionMap.set(sectionKey, {
+          ...sectionValue,
+          updatedAt: new Date().toISOString()
+        });
+      }
+      await persistArrangementSections();
+      await persistArrangementSectionProfiles();
+      return textResult({
+        ok: true,
+        profileName,
+        merge,
+        totalSections: arrangementSectionMap.size
+      });
+    })
+);
+
+server.registerTool(
+  "clone_arrangement_section_map",
+  {
+    title: "Clone Arrangement Section Map",
+    description: "Clone section profile to another profile name.",
+    inputSchema: {
+      sourceProfileName: z.string().min(1).max(128),
+      targetProfileName: z.string().min(1).max(128),
+      overwrite: z.boolean().optional().default(false)
+    }
+  },
+  async ({ sourceProfileName, targetProfileName, overwrite }) =>
+    withMetrics("clone_arrangement_section_map", async () => {
+      const srcKey = normalizeName(sourceProfileName);
+      const dstKey = normalizeName(targetProfileName);
+      const src = arrangementSectionProfiles.get(srcKey);
+      if (!src) throw new Error(`Unknown source profile: ${sourceProfileName}`);
+      if (!overwrite && arrangementSectionProfiles.has(dstKey)) {
+        throw new Error(`Target profile already exists: ${targetProfileName}. Use overwrite=true.`);
+      }
+      arrangementSectionProfiles.set(dstKey, {
+        profileName: targetProfileName,
+        savedAt: new Date().toISOString(),
+        clonedFrom: sourceProfileName,
+        sections: src.sections.map(([k, v]) => [k, { ...v }])
+      });
+      await persistArrangementSectionProfiles();
+      return textResult({
+        ok: true,
+        sourceProfileName,
+        targetProfileName,
+        sectionCount: src.sections.length
+      });
+    })
+);
+
+server.registerTool(
+  "list_arrangement_section_profiles",
+  {
+    title: "List Arrangement Section Profiles",
+    description: "List saved arrangement section profiles."
+  },
+  async () =>
+    withMetrics("list_arrangement_section_profiles", async () =>
+      textResult({
+        profiles: [...arrangementSectionProfiles.values()].map((p) => ({
+          profileName: p.profileName,
+          savedAt: p.savedAt,
+          clonedFrom: p.clonedFrom ?? null,
+          sectionCount: Array.isArray(p.sections) ? p.sections.length : 0
+        }))
+      })
+    )
+);
+
+server.registerTool(
+  "delete_arrangement_section_profile",
+  {
+    title: "Delete Arrangement Section Profile",
+    description: "Delete a saved arrangement section profile.",
+    inputSchema: { profileName: z.string().min(1).max(128) }
+  },
+  async ({ profileName }) =>
+    withMetrics("delete_arrangement_section_profile", async () => {
+      const deleted = arrangementSectionProfiles.delete(normalizeName(profileName));
+      if (deleted) await persistArrangementSectionProfiles();
+      return textResult({ ok: true, profileName, deleted });
+    })
+);
+
+server.registerTool(
+  "delete_arrangement_section",
+  {
+    title: "Delete Arrangement Section",
+    description: "Delete a saved named arrangement section.",
+    inputSchema: { sectionName: z.string().min(1).max(64) }
+  },
+  async ({ sectionName }) =>
+    withMetrics("delete_arrangement_section", async () => {
+      const key = normalizeName(sectionName);
+      const existed = arrangementSectionMap.delete(key);
+      if (existed) await persistArrangementSections();
+      return textResult({ ok: true, deleted: existed, sectionName });
+    })
+);
+
+server.registerTool(
   "arrangement_intelligence",
   {
     title: "Arrangement Intelligence",
@@ -3304,11 +3625,17 @@ server.registerTool(
     inputSchema: {
       sectionName: z.string().min(1).max(64),
       bars: z.number().int().min(1).max(64).default(8),
-      duplicateNow: z.boolean().optional().default(false)
+      startBeats: z.number().min(0).optional().default(0),
+      duplicateNow: z.boolean().optional().default(false),
+      createBoundaryLocators: z.boolean().optional().default(true)
     }
   },
-  async ({ sectionName, bars, duplicateNow }) =>
+  async ({ sectionName, bars, startBeats, duplicateNow, createBoundaryLocators }) =>
     withMetrics("arrangement_intelligence", async () => {
+      const resolved = arrangementSectionMap.get(normalizeName(sectionName));
+      const resolvedStartBeats = resolved?.startBeats ?? startBeats;
+      const resolvedBars = resolved?.bars ?? bars;
+      const lengthBeats = resolvedBars * 4;
       const suggestions = [
         `Add transition FX in the last bar of ${sectionName}.`,
         `Reduce drum density for first half of ${sectionName}.`,
@@ -3316,12 +3643,50 @@ server.registerTool(
       ];
       let duplicateResult = null;
       if (duplicateNow) {
-        duplicateResult = sendPlanRaw("/live/song/duplicate_time", [floatArg(0), floatArg(bars * 4)], {
-          startBeats: 0,
-          lengthBeats: bars * 4
+        duplicateResult = sendPlanRaw("/live/song/duplicate_time", [floatArg(resolvedStartBeats), floatArg(lengthBeats)], {
+          startBeats: resolvedStartBeats,
+          lengthBeats
         });
       }
-      return textResult({ ok: true, sectionName, bars, suggestions, duplicateResult });
+      const locatorWrites = [];
+      if (createBoundaryLocators) {
+        locatorWrites.push(
+          sendPlanRaw("/live/song/create_locator", [floatArg(resolvedStartBeats)], {
+            sectionName,
+            locator: "start"
+          })
+        );
+        locatorWrites.push(
+          sendPlanRaw("/live/song/set/last_locator_name", [stringArg(`${sectionName} START`)], {
+            sectionName,
+            locatorName: `${sectionName} START`
+          })
+        );
+        locatorWrites.push(
+          sendPlanRaw("/live/song/create_locator", [floatArg(resolvedStartBeats + lengthBeats)], {
+            sectionName,
+            locator: "end"
+          })
+        );
+        locatorWrites.push(
+          sendPlanRaw("/live/song/set/last_locator_name", [stringArg(`${sectionName} END`)], {
+            sectionName,
+            locatorName: `${sectionName} END`
+          })
+        );
+      }
+      return textResult({
+        ok: true,
+        sectionName,
+        bars: resolvedBars,
+        startBeats: resolvedStartBeats,
+        lengthBeats,
+        usedSavedSection: Boolean(resolved),
+        sectionMemory: resolved ?? null,
+        suggestions,
+        duplicateResult,
+        locatorWrites
+      });
     })
 );
 
@@ -3338,22 +3703,47 @@ server.registerTool(
       const report = [];
       for (const track of tracks.tracks.slice(0, sampleTracks)) {
         try {
-          const vol = await requestAny(["/live/track/get/volume"], [intArg(track.index)]);
+          const [vol, pan, mute, solo, arm] = await Promise.all([
+            requestAny(["/live/track/get/volume"], [intArg(track.index)]),
+            requestAny(["/live/track/get/panning"], [intArg(track.index)]),
+            requestAny(["/live/track/get/mute"], [intArg(track.index)]),
+            requestAny(["/live/track/get/solo"], [intArg(track.index)]),
+            requestAny(["/live/track/get/arm"], [intArg(track.index)])
+          ]);
           const level = Number(parseOscValue(vol.response, 0.85));
+          const panValue = Number(parseOscValue(pan.response, 0));
+          const isMuted = Boolean(parseOscValue(mute.response, 0));
+          const isSolo = Boolean(parseOscValue(solo.response, 0));
+          const isArmed = Boolean(parseOscValue(arm.response, 0));
+          const warnings = [];
+          if (level > 0.95) warnings.push("Potential clipping risk.");
+          if (level < 0.15 && !isMuted) warnings.push("Very low level while unmuted.");
+          if (Math.abs(panValue) > 0.95) warnings.push("Hard panned; check stereo balance.");
+          if (isSolo) warnings.push("Track is soloed.");
+          if (isArmed) warnings.push("Track is armed.");
           report.push({
             trackIndex: track.index,
             name: track.name,
             volume: level,
-            warning: level > 0.95 ? "Potential clipping risk." : null
+            pan: panValue,
+            mute: isMuted,
+            solo: isSolo,
+            arm: isArmed,
+            warnings
           });
         } catch {
-          report.push({ trackIndex: track.index, name: track.name, warning: "Unable to read volume." });
+          report.push({ trackIndex: track.index, name: track.name, warnings: ["Unable to read mixer state."] });
         }
       }
+      const clippingRiskTracks = report.filter((r) => (r.warnings ?? []).includes("Potential clipping risk.")).length;
+      const soloedTracks = report.filter((r) => r.solo === true).length;
+      const armedTracks = report.filter((r) => r.arm === true).length;
       return textResult({
         ok: true,
         summary: {
-          clippingRiskTracks: report.filter((r) => r.warning === "Potential clipping risk.").length
+          clippingRiskTracks,
+          soloedTracks,
+          armedTracks
         },
         report
       });
@@ -3437,24 +3827,67 @@ server.registerTool(
     title: "Generate Drum Pattern",
     description: "Generate drum pattern scaffold with optional variation hints.",
     inputSchema: {
+      trackIndex: z.number().int().min(0).optional(),
+      clipIndex: z.number().int().min(0).optional(),
       style: z.enum(["house", "techno", "trap", "dnb"]).default("house"),
       bars: z.number().int().min(1).max(16).default(4),
-      variation: z.boolean().optional().default(true)
+      variation: z.boolean().optional().default(true),
+      writeToClip: z.boolean().optional().default(false)
     }
   },
-  async ({ style, bars, variation }) =>
+  async ({ trackIndex, clipIndex, style, bars, variation, writeToClip }) =>
     withMetrics("generate_drum_pattern", async () => {
       const base = {
         kick: "1.1,1.2,1.3,1.4",
         snare: style === "trap" ? "1.3" : "1.2,1.4",
         hats: style === "dnb" ? "1.125,1.375,1.625,1.875" : "1.25,1.5,1.75"
       };
+      const totalBeats = bars * 4;
+      const notes = [];
+      for (let b = 0; b < totalBeats; b += 1) {
+        notes.push({ pitch: 36, start: b, duration: 0.2, velocity: 120, mute: false }); // kick
+        if (b % 2 === 1) notes.push({ pitch: 38, start: b, duration: 0.18, velocity: 108, mute: false }); // snare
+        const hatVelocity = variation && b % 4 === 3 ? 85 : 96;
+        notes.push({ pitch: 42, start: b + 0.5, duration: 0.1, velocity: hatVelocity, mute: false }); // hat
+      }
+      if (style === "trap") {
+        for (let b = 0; b < totalBeats; b += 2) {
+          notes.push({ pitch: 42, start: b + 1.75, duration: 0.08, velocity: 80, mute: false });
+        }
+      }
+      let writeResult = null;
+      if (writeToClip) {
+        if (trackIndex === undefined || clipIndex === undefined) {
+          throw new Error("trackIndex and clipIndex are required when writeToClip=true.");
+        }
+        const writes = [];
+        for (const note of notes) {
+          writes.push(
+            sendPlanRaw("/live/clip/add_note", [
+              intArg(trackIndex),
+              intArg(clipIndex),
+              intArg(note.pitch),
+              floatArg(note.start),
+              floatArg(note.duration),
+              intArg(note.velocity),
+              intArg(note.mute ? 1 : 0)
+            ])
+          );
+        }
+        writeResult = {
+          trackIndex,
+          clipIndex,
+          notesWritten: writes.length
+        };
+      }
       return textResult({
         ok: true,
         style,
         bars,
         basePattern: base,
-        variationHints: variation ? ["Ghost snare before backbeat", "Open hat every 4 bars"] : []
+        variationHints: variation ? ["Ghost snare before backbeat", "Open hat every 4 bars"] : [],
+        notes,
+        writeResult
       });
     })
 );
@@ -3892,6 +4325,8 @@ async function main() {
   connectionState.connected = true;
   connectionState.lastReadyAt = new Date().toISOString();
   await loadPersistedEndpointSelections();
+  await loadPersistedArrangementSections();
+  await loadPersistedArrangementSectionProfiles();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Do warmup after MCP connect so initialize doesn't time out.
