@@ -78,12 +78,34 @@ const stateCache = {
   lastRefreshAt: null,
   transport: null,
   tracks: null,
-  pendingConflicts: []
+  pendingConflicts: [],
+  channels: [],
+  eventStream: []
 };
 const protocolDiagnostics = {
   lastOutgoingAt: null,
   lastIncomingAt: null,
   lastRttMs: null
+};
+const aliasRegistry = new Map();
+const presetRegistry = new Map();
+const exportJobs = new Map();
+const userPreferences = {
+  defaultKey: "C",
+  defaultScale: "minor",
+  defaultTempo: 124,
+  explanationMode: "producer"
+};
+const liveSafetyState = {
+  enabled: false,
+  lockedTracks: [],
+  lockedDevices: []
+};
+const templateRegistry = new Map();
+const externalHooks = {
+  notionEnabled: false,
+  releaseTrackerEnabled: false,
+  backupEnabled: false
 };
 
 const OSC_ENDPOINT_VARIANTS = {
@@ -137,6 +159,42 @@ async function loadPersistedEndpointSelections() {
   } catch {
     // no persisted file yet
   }
+}
+
+function pushEventCache(event) {
+  const enriched = { at: new Date().toISOString(), ...event };
+  stateCache.eventStream.push(enriched);
+  if (stateCache.eventStream.length > 200) {
+    stateCache.eventStream = stateCache.eventStream.slice(-200);
+  }
+  return enriched;
+}
+
+function buildCapabilityProfile() {
+  const summary = probeSummary ?? {};
+  const getOk = (k) => Boolean(summary[k]?.ok);
+  const selectedWrites = {
+    renderAudio: endpointSelections.get("renderAudio") ?? null,
+    renderStems: endpointSelections.get("renderStems") ?? null,
+    routing: endpointSelections.get("trackSetRouting") ?? null,
+    presets: endpointSelections.get("deviceLoadPreset") ?? null,
+    subscribe: endpointSelections.get("subscribeEvents") ?? null
+  };
+
+  const readsCore = getOk("tempoGet") && getOk("trackCountGet") && getOk("trackNameGet");
+  const scenes = getOk("sceneCountGet");
+  const devices = getOk("deviceCountGet") && getOk("deviceParameterGet");
+  const writesReady = Boolean(selectedWrites.renderAudio || selectedWrites.renderStems);
+
+  let profile = "minimal";
+  if (readsCore && devices && scenes && writesReady) profile = "extended";
+  else if (readsCore && (devices || scenes)) profile = "standard";
+
+  return {
+    profile,
+    readiness: { readsCore, scenes, devices, writesReady },
+    selectedWrites
+  };
 }
 
 function textResult(data) {
@@ -213,6 +271,11 @@ async function requestAny(candidates, args = []) {
       const response = await oscClient.request(candidate, args, candidate);
       protocolDiagnostics.lastIncomingAt = new Date().toISOString();
       protocolDiagnostics.lastRttMs = Date.now() - startedAt;
+      pushEventCache({
+        type: "osc_request_response",
+        address: candidate,
+        rttMs: protocolDiagnostics.lastRttMs
+      });
       return { address: candidate, response };
     } catch (error) {
       lastError = error;
@@ -347,6 +410,11 @@ function sendPlanRaw(address, args = [], metadata = {}, options = {}) {
     };
   }
   protocolDiagnostics.lastOutgoingAt = new Date().toISOString();
+  pushEventCache({
+    type: "osc_send",
+    address,
+    args: args.map((a) => a.value)
+  });
   oscClient.send(address, args);
   return { ok: true, address, ...metadata };
 }
@@ -417,6 +485,106 @@ server.registerTool(
       sendPort: config.ABLETON_OSC_SEND_PORT,
       listenPort: config.ABLETON_OSC_LISTEN_PORT,
       protocolDiagnostics
+    })
+);
+
+server.registerTool(
+  "get_ops_dashboard",
+  {
+    title: "Get Ops Dashboard",
+    description:
+      "Unified operational dashboard: health, diagnostics, capability profile, conflicts, recent events, and export jobs.",
+    inputSchema: {
+      includeProbeSummary: z.boolean().optional().default(false),
+      recentEventsLimit: z.number().int().min(1).max(50).optional().default(10),
+      recentJobsLimit: z.number().int().min(1).max(50).optional().default(10)
+    }
+  },
+  async ({ includeProbeSummary, recentEventsLimit, recentJobsLimit }) =>
+    withMetrics("get_ops_dashboard", async () => {
+      const capability = buildCapabilityProfile();
+      const recentEvents = (stateCache.eventStream ?? []).slice(-recentEventsLimit);
+      const recentJobs = [...exportJobs.values()]
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        .slice(0, recentJobsLimit);
+      return textResult({
+        status: "ok",
+        now: new Date().toISOString(),
+        connection: {
+          host: config.ABLETON_OSC_HOST,
+          sendPort: config.ABLETON_OSC_SEND_PORT,
+          listenPort: config.ABLETON_OSC_LISTEN_PORT,
+          connected: connectionState.connected
+        },
+        health: {
+          probeReady: probeSummary !== null,
+          startupWarnings,
+          metrics: {
+            totalCommands: metrics.totalCommands,
+            successfulCommands: metrics.successfulCommands,
+            failedCommands: metrics.failedCommands,
+            dryRunCommands: metrics.dryRunCommands,
+            lastError: metrics.lastError
+          }
+        },
+        protocolDiagnostics,
+        capabilityProfile: capability,
+        policy: {
+          policyState,
+          runtimeContext
+        },
+        conflicts: {
+          pending: stateCache.pendingConflicts ?? [],
+          cacheLastRefreshAt: stateCache.lastRefreshAt
+        },
+        subscriptions: {
+          channels: stateCache.channels ?? [],
+          recentEvents
+        },
+        exportJobs: {
+          total: exportJobs.size,
+          recentJobs
+        },
+        probeSummary: includeProbeSummary ? probeSummary : undefined
+      });
+    })
+);
+
+server.registerTool(
+  "get_ops_dashboard_compact",
+  {
+    title: "Get Ops Dashboard Compact",
+    description: "Compact status summary for quick operational checks."
+  },
+  async () =>
+    withMetrics("get_ops_dashboard_compact", async () => {
+      const capability = buildCapabilityProfile();
+      const recentJob = [...exportJobs.values()].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0] ?? null;
+      const recentEvent = (stateCache.eventStream ?? []).slice(-1)[0] ?? null;
+      const status = metrics.failedCommands > 0 || (stateCache.pendingConflicts ?? []).length > 0 ? "warning" : "ok";
+      return textResult({
+        status,
+        connected: connectionState.connected,
+        probeReady: probeSummary !== null,
+        profile: capability.profile,
+        totalCommands: metrics.totalCommands,
+        failedCommands: metrics.failedCommands,
+        lastErrorCode: metrics.lastError ? classifyError({ message: metrics.lastError.message }) : null,
+        pendingConflicts: stateCache.pendingConflicts ?? [],
+        channels: stateCache.channels ?? [],
+        lastRttMs: protocolDiagnostics.lastRttMs,
+        recentJob: recentJob
+          ? {
+              jobId: recentJob.jobId,
+              status: recentJob.status,
+              profileName: recentJob.profileName,
+              createdAt: recentJob.createdAt
+            }
+          : null,
+        recentEvent: recentEvent
+          ? { at: recentEvent.at, type: recentEvent.type, address: recentEvent.address ?? null }
+          : null
+      });
     })
 );
 
@@ -740,13 +908,21 @@ async function captureRollbackSnapshotInternal(snapshotId) {
     reverseOpsHint: [
       {
         action: "set_tempo",
-        params: { bpm: Number(parseOscValue(overviewResp.response, 120)) }
+        params: { bpm: Number(parseOscValue(overviewResp.response, 120)) },
+        metadata: { confidence: "high", source: "captured-tempo" }
       },
       {
         action: "jump_to_time",
-        params: { timeBeats: Number(parseOscValue(timeResp.response, 0)) }
+        params: { timeBeats: Number(parseOscValue(timeResp.response, 0)) },
+        metadata: { confidence: "high", source: "captured-transport-time" }
       }
-    ]
+    ],
+    reverseOpsMeta: {
+      generatedAt: new Date().toISOString(),
+      caution:
+        "Reverse operations are best-effort and do not include full clip/device state rollback.",
+      destructiveActionsRecommended: ["delete_clip", "delete_scene", "arrangement_delete_range"]
+    }
   };
   snapshots.set(snapshotId, snapshot);
   return snapshot;
@@ -1069,6 +1245,71 @@ async function runActionPlanExecution({
   };
 }
 
+async function preflightActionPlan({ actions, confirmToken, maxCacheAgeMs = 10000 }) {
+  const checks = [];
+  const errors = [];
+  const warnings = [];
+
+  for (let i = 0; i < actions.length; i += 1) {
+    const step = actions[i];
+    const schema = planParamSchemas[step.action];
+    if (!schema) {
+      errors.push({
+        index: i,
+        action: step.action,
+        errorCode: "PLAN_ACTION_UNKNOWN",
+        message: `Unknown or disallowed action "${step.action}".`
+      });
+      continue;
+    }
+    try {
+      schema.parse(step.params ?? {});
+      checks.push({ index: i, action: step.action, ok: true });
+    } catch (error) {
+      errors.push({
+        index: i,
+        action: step.action,
+        errorCode: "PLAN_PARAM_INVALID",
+        message: error.message
+      });
+    }
+  }
+
+  const destructiveInPlan = actions.some((a) => PLAN_DESTRUCTIVE_ACTIONS.has(a.action));
+  if (destructiveInPlan) {
+    if (config.ABLETON_REQUIRE_DESTRUCTIVE_CONFIRM && confirmToken !== DESTRUCTIVE_CONFIRM_TOKEN) {
+      errors.push({
+        errorCode: "DESTRUCTIVE_CONFIRM_REQUIRED",
+        message: `Plan has destructive actions; pass confirmToken="${DESTRUCTIVE_CONFIRM_TOKEN}".`
+      });
+    }
+    if (runtimeContext.performanceMode) {
+      errors.push({
+        errorCode: "POLICY_BLOCKED",
+        message: "Destructive action blocked while performanceMode is enabled."
+      });
+    }
+  }
+
+  const now = Date.now();
+  const last = stateCache.lastRefreshAt ? Date.parse(stateCache.lastRefreshAt) : 0;
+  const stale = !last || now - last > maxCacheAgeMs;
+  if (stale) {
+    warnings.push("State cache is stale; run refresh_state_cache before plan execution.");
+  }
+  if (stateCache.pendingConflicts.length > 0) {
+    warnings.push(...stateCache.pendingConflicts);
+  }
+
+  return {
+    ok: errors.length === 0,
+    checks,
+    warnings,
+    errors,
+    destructiveInPlan
+  };
+}
+
 server.registerTool(
   "execute_action_plan",
   {
@@ -1153,6 +1394,46 @@ server.registerTool(
 );
 
 server.registerTool(
+  "preflight_action_plan",
+  {
+    title: "Preflight Action Plan",
+    description: "Validate action-plan schema/policy/conflicts before execution.",
+    inputSchema: {
+      planId: z.string().min(1).max(128).optional(),
+      actions: z
+        .array(
+          z.object({
+            action: z.string().min(1).max(64),
+            params: z.record(z.unknown()).default({})
+          })
+        )
+        .optional(),
+      confirmToken: z.string().optional(),
+      maxCacheAgeMs: z.number().int().min(1).max(600000).optional().default(10000)
+    }
+  },
+  async ({ planId, actions: inlineActions, confirmToken, maxCacheAgeMs }) =>
+    withMetrics("preflight_action_plan", async () => {
+      let actions = inlineActions;
+      if (planId) {
+        const plan = pendingPlans.get(planId);
+        if (!plan) throw new Error(`Unknown planId: ${planId}`);
+        actions = plan.actions;
+      }
+      if (!actions || actions.length === 0) {
+        throw new Error("Provide planId or a non-empty actions array.");
+      }
+      return textResult(
+        await preflightActionPlan({
+          actions,
+          confirmToken,
+          maxCacheAgeMs
+        })
+      );
+    })
+);
+
+server.registerTool(
   "get_policy_state",
   {
     title: "Get Policy State",
@@ -1217,13 +1498,35 @@ server.registerTool(
     withMetrics("subscribe_session_events", async () => {
       stateCache.channels = [...new Set(channels)];
       const args = stateCache.channels.map((c) => stringArg(c));
+      const cachedEvent = pushEventCache({
+        type: "subscription_update",
+        channels: stateCache.channels
+      });
       return sendKnownMaybe(
         "subscribeEvents",
         ["/live/subscribe"],
         args,
-        { subscribedChannels: stateCache.channels }
+        { subscribedChannels: stateCache.channels, cachedEvent }
       );
     })
+);
+
+server.registerTool(
+  "get_session_event_cache",
+  {
+    title: "Get Session Event Cache",
+    description: "Return latest in-memory session event stream cache.",
+    inputSchema: {
+      limit: z.number().int().min(1).max(200).optional().default(50)
+    }
+  },
+  async ({ limit }) =>
+    withMetrics("get_session_event_cache", async () =>
+      textResult({
+        channels: stateCache.channels ?? [],
+        events: (stateCache.eventStream ?? []).slice(-limit)
+      })
+    )
 );
 
 server.registerTool(
@@ -1246,6 +1549,28 @@ server.registerTool(
         conflicts.push("Performance mode enabled; destructive and high-risk changes should be avoided.");
       stateCache.pendingConflicts = conflicts;
       return textResult({ ok: true, stale, conflicts });
+    })
+);
+
+server.registerTool(
+  "detect_capability_profile",
+  {
+    title: "Detect Capability Profile",
+    description: "Classify current AbletonOSC compatibility profile.",
+    inputSchema: {
+      reprobe: z.boolean().optional().default(false)
+    }
+  },
+  async ({ reprobe }) =>
+    withMetrics("detect_capability_profile", async () => {
+      if (reprobe) {
+        probeSummary = await runCapabilityProbe();
+      }
+      return textResult({
+        ok: true,
+        ...buildCapabilityProfile(),
+        probeSummary
+      });
     })
 );
 
@@ -1373,6 +1698,153 @@ server.registerTool(
 );
 
 server.registerTool(
+  "create_export_job",
+  {
+    title: "Create Export Job",
+    description: "Create export job scaffold for queued render execution.",
+    inputSchema: {
+      profileName: z.string().min(1).max(64),
+      targetPath: z.string().min(1).max(512),
+      autoStart: z.boolean().optional().default(false),
+      confirmToken: z.string().optional()
+    }
+  },
+  async ({ profileName, targetPath, autoStart, confirmToken }) =>
+    withMetrics("create_export_job", async () => {
+      const profile = exportProfiles.get(profileName);
+      if (!profile) throw new Error(`Unknown export profile: ${profileName}`);
+      const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const job = {
+        jobId,
+        status: "queued",
+        profileName,
+        targetPath,
+        createdAt: new Date().toISOString(),
+        startedAt: null,
+        completedAt: null,
+        error: null
+      };
+      exportJobs.set(jobId, job);
+
+      if (autoStart) {
+        guardDestructive(confirmToken);
+        job.status = "running";
+        job.startedAt = new Date().toISOString();
+        try {
+          if (profile.type === "master") {
+            await sendKnownRaw(
+              "renderAudio",
+              ["/live/song/export_audio"],
+              [stringArg(targetPath), toBoolInt(profile.exportMaster), toBoolInt(profile.normalize)],
+              { jobId, profileName, targetPath, destructive: true }
+            );
+          } else {
+            await sendKnownRaw(
+              "renderStems",
+              ["/live/song/export_stems"],
+              [stringArg(targetPath), toBoolInt(profile.includeReturns)],
+              { jobId, profileName, targetPath, destructive: true }
+            );
+          }
+          job.status = "completed";
+          job.completedAt = new Date().toISOString();
+        } catch (error) {
+          job.status = "failed";
+          job.completedAt = new Date().toISOString();
+          job.error = { errorCode: classifyError(error), message: error.message };
+        }
+      }
+
+      return textResult({ ok: true, job });
+    })
+);
+
+server.registerTool(
+  "run_export_job",
+  {
+    title: "Run Export Job",
+    description: "Execute a previously queued export job.",
+    inputSchema: {
+      jobId: z.string().min(1).max(128),
+      confirmToken: z.string().optional()
+    }
+  },
+  async ({ jobId, confirmToken }) =>
+    withMetrics("run_export_job", async () => {
+      const job = exportJobs.get(jobId);
+      if (!job) throw new Error(`Unknown export job: ${jobId}`);
+      if (job.status === "completed") {
+        return textResult({ ok: true, job, note: "Job already completed." });
+      }
+      const profile = exportProfiles.get(job.profileName);
+      if (!profile) throw new Error(`Unknown export profile: ${job.profileName}`);
+      guardDestructive(confirmToken);
+
+      job.status = "running";
+      job.startedAt = new Date().toISOString();
+      try {
+        if (profile.type === "master") {
+          await sendKnownRaw(
+            "renderAudio",
+            ["/live/song/export_audio"],
+            [stringArg(job.targetPath), toBoolInt(profile.exportMaster), toBoolInt(profile.normalize)],
+            { jobId, profileName: job.profileName, targetPath: job.targetPath, destructive: true }
+          );
+        } else {
+          await sendKnownRaw(
+            "renderStems",
+            ["/live/song/export_stems"],
+            [stringArg(job.targetPath), toBoolInt(profile.includeReturns)],
+            { jobId, profileName: job.profileName, targetPath: job.targetPath, destructive: true }
+          );
+        }
+        job.status = "completed";
+        job.completedAt = new Date().toISOString();
+      } catch (error) {
+        job.status = "failed";
+        job.error = { errorCode: classifyError(error), message: error.message };
+        job.completedAt = new Date().toISOString();
+      }
+      return textResult({ ok: job.status === "completed", job });
+    })
+);
+
+server.registerTool(
+  "get_export_job",
+  {
+    title: "Get Export Job",
+    description: "Return one export job by id.",
+    inputSchema: {
+      jobId: z.string().min(1).max(128)
+    }
+  },
+  async ({ jobId }) =>
+    withMetrics("get_export_job", async () => {
+      const job = exportJobs.get(jobId);
+      if (!job) throw new Error(`Unknown export job: ${jobId}`);
+      return textResult({ job });
+    })
+);
+
+server.registerTool(
+  "list_export_jobs",
+  {
+    title: "List Export Jobs",
+    description: "List recent export jobs.",
+    inputSchema: {
+      limit: z.number().int().min(1).max(200).optional().default(50)
+    }
+  },
+  async ({ limit }) =>
+    withMetrics("list_export_jobs", async () => {
+      const jobs = [...exportJobs.values()]
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        .slice(0, limit);
+      return textResult({ jobs });
+    })
+);
+
+server.registerTool(
   "compile_plan_from_intent",
   {
     title: "Compile Plan From Intent",
@@ -1456,8 +1928,18 @@ server.registerTool(
       sendKnownMaybe(
         "deviceLoadPreset",
         ["/live/device/load_preset"],
-        [intArg(trackIndex), intArg(deviceIndex), stringArg(presetName)],
-        { trackIndex, deviceIndex, presetName }
+        [
+          intArg(trackIndex),
+          intArg(deviceIndex),
+          stringArg(presetRegistry.get(normalizeName(presetName))?.presetName ?? presetName)
+        ],
+        {
+          trackIndex,
+          deviceIndex,
+          presetName,
+          resolvedPreset:
+            presetRegistry.get(normalizeName(presetName))?.presetName ?? presetName
+        }
       )
     )
 );
@@ -1610,6 +2092,75 @@ server.registerTool(
         candidates: ranked.slice(0, 10)
       });
     })
+);
+
+server.registerTool(
+  "upsert_alias",
+  {
+    title: "Upsert Alias",
+    description: "Register alias mapping for track/scene/device references.",
+    inputSchema: {
+      alias: z.string().min(1).max(128),
+      targetType: z.enum(["track", "scene", "device", "preset"]),
+      targetValue: z.string().min(1).max(256)
+    }
+  },
+  async ({ alias, targetType, targetValue }) =>
+    withMetrics("upsert_alias", async () => {
+      const key = normalizeName(alias);
+      aliasRegistry.set(key, { alias, targetType, targetValue, updatedAt: new Date().toISOString() });
+      return textResult({ ok: true, alias: aliasRegistry.get(key) });
+    })
+);
+
+server.registerTool(
+  "resolve_alias",
+  {
+    title: "Resolve Alias",
+    description: "Resolve a previously stored alias.",
+    inputSchema: {
+      alias: z.string().min(1).max(128)
+    }
+  },
+  async ({ alias }) =>
+    withMetrics("resolve_alias", async () => {
+      const key = normalizeName(alias);
+      const resolved = aliasRegistry.get(key) ?? null;
+      return textResult({ alias, resolved });
+    })
+);
+
+server.registerTool(
+  "register_device_preset_alias",
+  {
+    title: "Register Device Preset Alias",
+    description: "Register named preset alias for load_device_preset workflows.",
+    inputSchema: {
+      presetAlias: z.string().min(1).max(128),
+      presetName: z.string().min(1).max(256)
+    }
+  },
+  async ({ presetAlias, presetName }) =>
+    withMetrics("register_device_preset_alias", async () => {
+      const key = normalizeName(presetAlias);
+      presetRegistry.set(key, { presetAlias, presetName, updatedAt: new Date().toISOString() });
+      return textResult({ ok: true, preset: presetRegistry.get(key) });
+    })
+);
+
+server.registerTool(
+  "list_alias_registry",
+  {
+    title: "List Alias Registry",
+    description: "Return current alias and preset registries."
+  },
+  async () =>
+    withMetrics("list_alias_registry", async () =>
+      textResult({
+        aliases: Object.fromEntries(aliasRegistry),
+        presets: Object.fromEntries(presetRegistry)
+      })
+    )
 );
 
 async function resolveTrackIndexFromName(trackName, minScore = 0.55) {
@@ -2667,6 +3218,626 @@ server.registerTool(
         sendMaybe("/live/song/stop_playing");
       }
       return textResult({ ok: true, restored: snapshot });
+    })
+);
+
+function scaleNotesForKey(key, scale) {
+  const chromatic = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+  const idx = chromatic.indexOf(String(key).toUpperCase());
+  const root = idx >= 0 ? idx : 0;
+  const intervals = scale === "major" ? [0, 2, 4, 5, 7, 9, 11] : [0, 2, 3, 5, 7, 8, 10];
+  return intervals.map((i) => (root + i) % 12);
+}
+
+function buildMidiNotePlan({ key, scale, bars, density, octave }) {
+  const scalePitchClasses = scaleNotesForKey(key, scale);
+  const notes = [];
+  const stepsPerBar = 4;
+  const totalSteps = bars * stepsPerBar;
+  const activeEvery = density === "high" ? 1 : density === "medium" ? 2 : 4;
+  for (let s = 0; s < totalSteps; s += 1) {
+    if (s % activeEvery !== 0) continue;
+    const degree = s % scalePitchClasses.length;
+    const pitch = octave * 12 + scalePitchClasses[degree];
+    notes.push({
+      pitch: Math.max(0, Math.min(127, pitch)),
+      start: s * 0.25,
+      duration: density === "high" ? 0.2 : 0.4,
+      velocity: density === "high" ? 92 : 105,
+      mute: false
+    });
+  }
+  return notes;
+}
+
+server.registerTool(
+  "compile_musical_intent",
+  {
+    title: "Compile Musical Intent",
+    description: "Convert high-level musical intent into an executable action plan scaffold.",
+    inputSchema: {
+      intent: z.string().min(1).max(500),
+      intensity: z.enum(["low", "medium", "high"]).optional().default("medium"),
+      bars: z.number().int().min(1).max(128).optional().default(8),
+      targetTrackName: z.string().min(1).max(128).optional()
+    }
+  },
+  async ({ intent, intensity, bars, targetTrackName }) =>
+    withMetrics("compile_musical_intent", async () => {
+      const actions = [];
+      const lowered = intent.toLowerCase();
+      if (lowered.includes("build") || lowered.includes("riser")) {
+        actions.push({
+          action: "write_device_automation_curve",
+          params: {
+            trackIndex: 0,
+            deviceIndex: 0,
+            parameterIndex: 0,
+            startBeats: 0,
+            endBeats: bars * 4,
+            startValue: 0.1,
+            endValue: intensity === "high" ? 1 : 0.8,
+            shape: "s-curve",
+            points: 24
+          }
+        });
+      }
+      if (targetTrackName) {
+        actions.push({
+          action: "set_track_volume_by_name",
+          params: {
+            trackName: targetTrackName,
+            volume: intensity === "high" ? 0.9 : 0.82
+          }
+        });
+      }
+      if (actions.length === 0) actions.push({ action: "start_playback", params: {} });
+      return textResult({ ok: true, intent, compiledPlan: { actions }, bars, intensity });
+    })
+);
+
+server.registerTool(
+  "arrangement_intelligence",
+  {
+    title: "Arrangement Intelligence",
+    description: "Provide section-level arrangement suggestions and optional duplicate action scaffold.",
+    inputSchema: {
+      sectionName: z.string().min(1).max(64),
+      bars: z.number().int().min(1).max(64).default(8),
+      duplicateNow: z.boolean().optional().default(false)
+    }
+  },
+  async ({ sectionName, bars, duplicateNow }) =>
+    withMetrics("arrangement_intelligence", async () => {
+      const suggestions = [
+        `Add transition FX in the last bar of ${sectionName}.`,
+        `Reduce drum density for first half of ${sectionName}.`,
+        `Create locator for "${sectionName}" boundary.`
+      ];
+      let duplicateResult = null;
+      if (duplicateNow) {
+        duplicateResult = sendPlanRaw("/live/song/duplicate_time", [floatArg(0), floatArg(bars * 4)], {
+          startBeats: 0,
+          lengthBeats: bars * 4
+        });
+      }
+      return textResult({ ok: true, sectionName, bars, suggestions, duplicateResult });
+    })
+);
+
+server.registerTool(
+  "run_mix_health_check",
+  {
+    title: "Run Mix Health Check",
+    description: "Best-effort diagnostics for gain staging and session sanity.",
+    inputSchema: { sampleTracks: z.number().int().min(1).max(32).optional().default(8) }
+  },
+  async ({ sampleTracks }) =>
+    withMetrics("run_mix_health_check", async () => {
+      const tracks = await getTracksSnapshot();
+      const report = [];
+      for (const track of tracks.tracks.slice(0, sampleTracks)) {
+        try {
+          const vol = await requestAny(["/live/track/get/volume"], [intArg(track.index)]);
+          const level = Number(parseOscValue(vol.response, 0.85));
+          report.push({
+            trackIndex: track.index,
+            name: track.name,
+            volume: level,
+            warning: level > 0.95 ? "Potential clipping risk." : null
+          });
+        } catch {
+          report.push({ trackIndex: track.index, name: track.name, warning: "Unable to read volume." });
+        }
+      }
+      return textResult({
+        ok: true,
+        summary: {
+          clippingRiskTracks: report.filter((r) => r.warning === "Potential clipping risk.").length
+        },
+        report
+      });
+    })
+);
+
+server.registerTool(
+  "apply_sound_design_macro",
+  {
+    title: "Apply Sound Design Macro",
+    description: "Apply multi-parameter morph scaffold for a target device.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0),
+      deviceIndex: z.number().int().min(0),
+      macroName: z.string().min(1).max(64),
+      intensity: z.number().min(0).max(1).optional().default(0.7)
+    }
+  },
+  async ({ trackIndex, deviceIndex, macroName, intensity }) =>
+    withMetrics("apply_sound_design_macro", async () => {
+      const writes = [
+        sendPlanRaw(
+          "/live/device/set/parameter/value",
+          [intArg(trackIndex), intArg(deviceIndex), intArg(0), floatArg(0.2 + 0.6 * intensity)],
+          { macroName, parameterIndex: 0 }
+        ),
+        sendPlanRaw(
+          "/live/device/set/parameter/value",
+          [intArg(trackIndex), intArg(deviceIndex), intArg(1), floatArg(0.3 + 0.5 * intensity)],
+          { macroName, parameterIndex: 1 }
+        )
+      ];
+      return textResult({ ok: true, trackIndex, deviceIndex, macroName, intensity, writes });
+    })
+);
+
+server.registerTool(
+  "generate_midi_phrase",
+  {
+    title: "Generate MIDI Phrase",
+    description: "Generate key/scale-aware MIDI notes and optionally write into a clip.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0),
+      clipIndex: z.number().int().min(0),
+      key: z.string().min(1).max(3).optional().default("C"),
+      scale: z.enum(["major", "minor"]).optional().default("minor"),
+      bars: z.number().int().min(1).max(32).optional().default(4),
+      density: z.enum(["low", "medium", "high"]).optional().default("medium"),
+      octave: z.number().int().min(1).max(8).optional().default(5),
+      writeToClip: z.boolean().optional().default(false)
+    }
+  },
+  async ({ trackIndex, clipIndex, key, scale, bars, density, octave, writeToClip }) =>
+    withMetrics("generate_midi_phrase", async () => {
+      const notes = buildMidiNotePlan({ key, scale, bars, density, octave });
+      let writeResult = null;
+      if (writeToClip) {
+        const writes = [];
+        for (const n of notes) {
+          writes.push(
+            sendPlanRaw("/live/clip/add_note", [
+              intArg(trackIndex),
+              intArg(clipIndex),
+              intArg(n.pitch),
+              floatArg(n.start),
+              floatArg(n.duration),
+              intArg(n.velocity),
+              intArg(0)
+            ])
+          );
+        }
+        writeResult = { notesWritten: writes.length };
+      }
+      return textResult({ ok: true, trackIndex, clipIndex, key, scale, bars, density, notes, writeResult });
+    })
+);
+
+server.registerTool(
+  "generate_drum_pattern",
+  {
+    title: "Generate Drum Pattern",
+    description: "Generate drum pattern scaffold with optional variation hints.",
+    inputSchema: {
+      style: z.enum(["house", "techno", "trap", "dnb"]).default("house"),
+      bars: z.number().int().min(1).max(16).default(4),
+      variation: z.boolean().optional().default(true)
+    }
+  },
+  async ({ style, bars, variation }) =>
+    withMetrics("generate_drum_pattern", async () => {
+      const base = {
+        kick: "1.1,1.2,1.3,1.4",
+        snare: style === "trap" ? "1.3" : "1.2,1.4",
+        hats: style === "dnb" ? "1.125,1.375,1.625,1.875" : "1.25,1.5,1.75"
+      };
+      return textResult({
+        ok: true,
+        style,
+        bars,
+        basePattern: base,
+        variationHints: variation ? ["Ghost snare before backbeat", "Open hat every 4 bars"] : []
+      });
+    })
+);
+
+server.registerTool(
+  "compose_automation_helper",
+  {
+    title: "Compose Automation Helper",
+    description: "Generate automation macro scaffolds (riser, ducking, drop).",
+    inputSchema: {
+      type: z.enum(["riser", "ducking", "drop"]),
+      lengthBeats: z.number().positive().default(16)
+    }
+  },
+  async ({ type, lengthBeats }) =>
+    withMetrics("compose_automation_helper", async () =>
+      textResult({
+        ok: true,
+        type,
+        suggestedPlan:
+          type === "riser"
+            ? [{ action: "write_device_automation_curve", params: { startBeats: 0, endBeats: lengthBeats } }]
+            : type === "ducking"
+              ? [{ action: "set_device_automation_point", params: { timeBeats: 0, value: 0.4 } }]
+              : [{ action: "set_device_automation_point", params: { timeBeats: lengthBeats, value: 1 } }]
+      })
+    )
+);
+
+server.registerTool(
+  "performance_scene_action",
+  {
+    title: "Performance Scene Action",
+    description: "Scene performance helper with optional safe-stop action.",
+    inputSchema: {
+      action: z.enum(["launch", "safe_stop"]),
+      sceneIndex: z.number().int().min(0).optional()
+    }
+  },
+  async ({ action, sceneIndex }) =>
+    withMetrics("performance_scene_action", async () => {
+      if (action === "safe_stop") {
+        return sendMaybe("/live/song/stop_all_clips", [], { mode: "performance-safe-stop" });
+      }
+      if (sceneIndex === undefined) throw new Error("sceneIndex is required for action=launch");
+      return sendMaybe("/live/scene/fire", [intArg(sceneIndex)], { sceneIndex, mode: "performance-launch" });
+    })
+);
+
+server.registerTool(
+  "configure_live_safety_rails",
+  {
+    title: "Configure Live Safety Rails",
+    description: "Enable/disable live safety rails and lock track/device lists.",
+    inputSchema: {
+      enabled: z.boolean().optional(),
+      lockedTracks: z.array(z.number().int().min(0)).optional(),
+      lockedDevices: z
+        .array(z.object({ trackIndex: z.number().int().min(0), deviceIndex: z.number().int().min(0) }))
+        .optional()
+    }
+  },
+  async ({ enabled, lockedTracks, lockedDevices }) =>
+    withMetrics("configure_live_safety_rails", async () => {
+      if (enabled !== undefined) liveSafetyState.enabled = enabled;
+      if (lockedTracks !== undefined) liveSafetyState.lockedTracks = [...new Set(lockedTracks)];
+      if (lockedDevices !== undefined) liveSafetyState.lockedDevices = lockedDevices;
+      return textResult({ ok: true, liveSafetyState });
+    })
+);
+
+server.registerTool(
+  "run_project_quality_checks",
+  {
+    title: "Run Project Quality Checks",
+    description: "Run high-level quality diagnostics and return issues list.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_project_quality_checks", async () => {
+      const checks = [];
+      if ((stateCache.tracks?.trackCount ?? 0) === 0) checks.push("Track cache is empty; refresh_state_cache.");
+      if (!stateCache.lastRefreshAt) checks.push("No recent state cache snapshot.");
+      if (!probeSummary) checks.push("Capability probe summary not ready yet.");
+      return textResult({ ok: checks.length === 0, issues: checks });
+    })
+);
+
+server.registerTool(
+  "reference_track_workflow",
+  {
+    title: "Reference Track Workflow",
+    description: "Scaffold for A/B reference checks and loudness alignment notes.",
+    inputSchema: {
+      referenceName: z.string().min(1).max(128),
+      targetLufs: z.number().min(-30).max(0).optional().default(-10)
+    }
+  },
+  async ({ referenceName, targetLufs }) =>
+    withMetrics("reference_track_workflow", async () =>
+      textResult({
+        ok: true,
+        referenceName,
+        checklist: [
+          "Route reference to dedicated track and bypass master bus FX.",
+          `Adjust reference gain toward ${targetLufs} LUFS equivalent perceived loudness.`,
+          "Perform 8-bar A/B loop comparison."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "export_batch_profiles",
+  {
+    title: "Export Batch Profiles",
+    description: "Queue and optionally run multiple export targets from named profiles.",
+    inputSchema: {
+      targets: z
+        .array(
+          z.object({
+            profileName: z.string().min(1).max(64),
+            targetPath: z.string().min(1).max(512)
+          })
+        )
+        .min(1),
+      autoStart: z.boolean().optional().default(false),
+      confirmToken: z.string().optional()
+    }
+  },
+  async ({ targets, autoStart, confirmToken }) =>
+    withMetrics("export_batch_profiles", async () => {
+      const created = [];
+      for (const target of targets) {
+        const profile = exportProfiles.get(target.profileName);
+        if (!profile) {
+          created.push({ ok: false, profileName: target.profileName, error: "Unknown profile" });
+          continue;
+        }
+        const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const job = {
+          jobId,
+          status: "queued",
+          profileName: target.profileName,
+          targetPath: target.targetPath,
+          createdAt: new Date().toISOString()
+        };
+        exportJobs.set(jobId, job);
+        created.push({ ok: true, jobId, profileName: target.profileName, targetPath: target.targetPath });
+        if (autoStart) {
+          guardDestructive(confirmToken);
+          job.status = "running";
+          if (profile.type === "master") {
+            await sendKnownRaw(
+              "renderAudio",
+              ["/live/song/export_audio"],
+              [stringArg(job.targetPath), toBoolInt(profile.exportMaster), toBoolInt(profile.normalize)],
+              { destructive: true, jobId }
+            );
+          } else {
+            await sendKnownRaw(
+              "renderStems",
+              ["/live/song/export_stems"],
+              [stringArg(job.targetPath), toBoolInt(profile.includeReturns)],
+              { destructive: true, jobId }
+            );
+          }
+          job.status = "completed";
+          job.completedAt = new Date().toISOString();
+        }
+      }
+      return textResult({ ok: true, created });
+    })
+);
+
+server.registerTool(
+  "set_user_preferences",
+  {
+    title: "Set User Preferences",
+    description: "Store musical/session preferences used by generation tools.",
+    inputSchema: {
+      defaultKey: z.string().min(1).max(3).optional(),
+      defaultScale: z.enum(["major", "minor"]).optional(),
+      defaultTempo: z.number().min(20).max(300).optional(),
+      explanationMode: z.enum(["beginner", "producer"]).optional()
+    }
+  },
+  async ({ defaultKey, defaultScale, defaultTempo, explanationMode }) =>
+    withMetrics("set_user_preferences", async () => {
+      if (defaultKey !== undefined) userPreferences.defaultKey = defaultKey;
+      if (defaultScale !== undefined) userPreferences.defaultScale = defaultScale;
+      if (defaultTempo !== undefined) userPreferences.defaultTempo = defaultTempo;
+      if (explanationMode !== undefined) userPreferences.explanationMode = explanationMode;
+      return textResult({ ok: true, userPreferences });
+    })
+);
+
+server.registerTool(
+  "get_user_preferences",
+  {
+    title: "Get User Preferences",
+    description: "Return current user preference profile."
+  },
+  async () => withMetrics("get_user_preferences", async () => textResult({ userPreferences }))
+);
+
+server.registerTool(
+  "ingest_voice_command",
+  {
+    title: "Ingest Voice Command",
+    description: "Parse voice command text into recommended MCP tool actions.",
+    inputSchema: {
+      commandText: z.string().min(1).max(500)
+    }
+  },
+  async ({ commandText }) =>
+    withMetrics("ingest_voice_command", async () => {
+      const c = commandText.toLowerCase();
+      const suggestion = c.includes("stop")
+        ? { tool: "performance_scene_action", args: { action: "safe_stop" } }
+        : c.includes("tempo")
+          ? { tool: "set_tempo", args: { bpm: userPreferences.defaultTempo } }
+          : { tool: "compile_musical_intent", args: { intent: commandText } };
+      return textResult({ ok: true, commandText, suggestion });
+    })
+);
+
+server.registerTool(
+  "semantic_plugin_control",
+  {
+    title: "Semantic Plugin Control",
+    description: "Map human wording to device parameter adjustment scaffold.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0),
+      deviceIndex: z.number().int().min(0),
+      prompt: z.string().min(1).max(200)
+    }
+  },
+  async ({ trackIndex, deviceIndex, prompt }) =>
+    withMetrics("semantic_plugin_control", async () => {
+      const p = prompt.toLowerCase();
+      const adjustment =
+        p.includes("bright") || p.includes("open")
+          ? { parameterIndex: 0, value: 0.75 }
+          : p.includes("tight") || p.includes("short")
+            ? { parameterIndex: 1, value: 0.35 }
+            : { parameterIndex: 0, value: 0.55 };
+      return sendMaybe(
+        "/live/device/set/parameter/value",
+        [intArg(trackIndex), intArg(deviceIndex), intArg(adjustment.parameterIndex), floatArg(adjustment.value)],
+        { prompt, ...adjustment }
+      );
+    })
+);
+
+server.registerTool(
+  "generate_collab_handoff",
+  {
+    title: "Generate Collab Handoff",
+    description: "Create a concise handoff summary of current project state and suggested next tasks.",
+    inputSchema: { contextNote: z.string().max(500).optional() }
+  },
+  async ({ contextNote }) =>
+    withMetrics("generate_collab_handoff", async () =>
+      textResult({
+        ok: true,
+        handoff: {
+          overview: "Session scaffold report generated by Ableton MCP bridge.",
+          recentMetrics: {
+            totalCommands: metrics.totalCommands,
+            failedCommands: metrics.failedCommands
+          },
+          nextSteps: [
+            "Run run_mix_health_check before final bounce.",
+            "Use preflight_action_plan for destructive plans.",
+            "Capture snapshot before major arrangement edits."
+          ],
+          contextNote: contextNote ?? null
+        }
+      })
+    )
+);
+
+server.registerTool(
+  "explain_action_for_learning",
+  {
+    title: "Explain Action For Learning",
+    description: "Return beginner/producer explanation for a given action and parameters.",
+    inputSchema: {
+      action: z.string().min(1).max(64),
+      params: z.record(z.unknown()).optional().default({})
+    }
+  },
+  async ({ action, params }) =>
+    withMetrics("explain_action_for_learning", async () => {
+      const mode = userPreferences.explanationMode;
+      const explanation =
+        mode === "beginner"
+          ? `Action "${action}" changes your set with params ${JSON.stringify(params)}. Use dry-run first if unsure.`
+          : `Action "${action}" will be applied with params ${JSON.stringify(params)}; validate against current arrangement and gain staging.`;
+      return textResult({ ok: true, mode, explanation });
+    })
+);
+
+server.registerTool(
+  "upsert_template_pack",
+  {
+    title: "Upsert Template Pack",
+    description: "Store reusable template/pack metadata for future apply workflows.",
+    inputSchema: {
+      name: z.string().min(1).max(128),
+      category: z.enum(["arrangement", "mix", "sound-design", "performance"]),
+      spec: z.record(z.unknown()).optional().default({})
+    }
+  },
+  async ({ name, category, spec }) =>
+    withMetrics("upsert_template_pack", async () => {
+      templateRegistry.set(normalizeName(name), {
+        name,
+        category,
+        spec,
+        updatedAt: new Date().toISOString()
+      });
+      return textResult({ ok: true, template: templateRegistry.get(normalizeName(name)) });
+    })
+);
+
+server.registerTool(
+  "list_template_packs",
+  {
+    title: "List Template Packs",
+    description: "List saved template packs."
+  },
+  async () =>
+    withMetrics("list_template_packs", async () =>
+      textResult({ templates: Object.fromEntries(templateRegistry) })
+    )
+);
+
+server.registerTool(
+  "run_show_mode_checklist",
+  {
+    title: "Run Show Mode Checklist",
+    description: "Run pre-show readiness checklist scaffolding.",
+    inputSchema: {
+      includeSafety: z.boolean().optional().default(true)
+    }
+  },
+  async ({ includeSafety }) =>
+    withMetrics("run_show_mode_checklist", async () => {
+      const checklist = [
+        "Verify audio interface sample rate and buffer size.",
+        "Confirm key scenes and locators are named.",
+        "Test emergency safe stop action."
+      ];
+      if (includeSafety) {
+        checklist.push(
+          liveSafetyState.enabled
+            ? "Live safety rails enabled."
+            : "Enable live safety rails before performance."
+        );
+      }
+      return textResult({ ok: true, checklist, liveSafetyState });
+    })
+);
+
+server.registerTool(
+  "configure_external_hooks",
+  {
+    title: "Configure External Hooks",
+    description: "Enable/disable external ecosystem hook scaffolding.",
+    inputSchema: {
+      notionEnabled: z.boolean().optional(),
+      releaseTrackerEnabled: z.boolean().optional(),
+      backupEnabled: z.boolean().optional()
+    }
+  },
+  async ({ notionEnabled, releaseTrackerEnabled, backupEnabled }) =>
+    withMetrics("configure_external_hooks", async () => {
+      if (notionEnabled !== undefined) externalHooks.notionEnabled = notionEnabled;
+      if (releaseTrackerEnabled !== undefined) externalHooks.releaseTrackerEnabled = releaseTrackerEnabled;
+      if (backupEnabled !== undefined) externalHooks.backupEnabled = backupEnabled;
+      return textResult({ ok: true, externalHooks });
     })
 );
 

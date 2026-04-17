@@ -12,6 +12,8 @@ This project is a local MCP server that lets Claude control Ableton Live through
   - `get_connection_info`
   - `get_last_error`
   - `get_protocol_diagnostics`
+  - `get_ops_dashboard`
+  - `get_ops_dashboard_compact`
   - `health_live_test`
   - `run_smoke_check`
   - `get_endpoint_capabilities`
@@ -33,7 +35,14 @@ This project is a local MCP server that lets Claude control Ableton Live through
   - `set_safety_mode`
   - `refresh_state_cache`
   - `subscribe_session_events`
+  - `get_session_event_cache`
   - `detect_plan_conflicts`
+  - `preflight_action_plan`
+  - `detect_capability_profile`
+  - `upsert_alias`
+  - `resolve_alias`
+  - `register_device_preset_alias`
+  - `list_alias_registry`
   - `start_playback`
   - `stop_playback`
   - `stop_all_clips`
@@ -74,6 +83,10 @@ This project is a local MCP server that lets Claude control Ableton Live through
   - `list_export_profiles`
   - `upsert_export_profile`
   - `render_with_profile` (destructive, confirmation required)
+  - `create_export_job`
+  - `run_export_job` (destructive, confirmation required)
+  - `get_export_job`
+  - `list_export_jobs`
   - `compile_plan_from_intent`
   - `create_conditional_plan`
   - `set_track_routing`
@@ -139,6 +152,31 @@ On startup, the server now performs an endpoint capability probe and selects the
 - `write_device_automation_curve` writes linear/s-curve/step automation points over a range.
 - `refresh_state_cache` and `detect_plan_conflicts` provide lightweight change/conflict detection scaffolding.
 
+## Creative Copilot tools (new)
+
+- `compile_musical_intent`
+- `arrangement_intelligence`
+- `run_mix_health_check`
+- `apply_sound_design_macro`
+- `generate_midi_phrase`
+- `generate_drum_pattern`
+- `compose_automation_helper`
+- `performance_scene_action`
+- `configure_live_safety_rails`
+- `run_project_quality_checks`
+- `reference_track_workflow`
+- `export_batch_profiles`
+- `set_user_preferences`
+- `get_user_preferences`
+- `ingest_voice_command`
+- `semantic_plugin_control`
+- `generate_collab_handoff`
+- `explain_action_for_learning`
+- `upsert_template_pack`
+- `list_template_packs`
+- `run_show_mode_checklist`
+- `configure_external_hooks`
+
 ## Test harness
 
 ```bash
@@ -184,4 +222,6 @@ Use your Claude Desktop MCP config file and add:
 - The destructive confirmation token is `YES_I_UNDERSTAND` (returned by `get_connection_info`).
 - Endpoint selections are persisted to `.ableton-endpoints.json` and reused on restart.
 - Audit logs are written to `logs/audit.jsonl` (best-effort, append-only).
+- Session event cache is in-memory and returned by `get_session_event_cache` (recent 200 events max).
+- Capability profile scaffold is available via `detect_capability_profile`.
 - If a specific endpoint differs in your AbletonOSC build, update it in `src/index.js`.

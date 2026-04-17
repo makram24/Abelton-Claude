@@ -79,10 +79,34 @@ This file tracks the full implementation roadmap requested for this project.
 - [x] Automation curve writer scaffolding
 - [x] Export profiles with reusable wrappers
 - [x] State cache + subscription scaffolding
+- [x] Session event-stream cache scaffolding
 - [x] Plan compiler and conditional/dependency schema scaffolding
 - [x] Routing and preset manager scaffolding
 - [x] Performance mode and conflict detection scaffolding
-- [ ] Capability profile detection scaffold
-- [ ] Alias/preset registry scaffold
-- [ ] Export job manager scaffold
-- [ ] Transaction preflight scaffold
+- [x] Capability profile detection scaffold
+- [x] Alias/preset registry scaffold
+- [x] Export job manager scaffold
+- [x] Transaction preflight scaffold
+
+## Phase 10 - Creative copilot expansion
+
+- [x] Musical intent compiler scaffold
+- [x] Arrangement intelligence scaffold
+- [x] Mix health check scaffold
+- [x] Sound design macro scaffold
+- [x] Key-aware MIDI phrase generator scaffold
+- [x] Drum pattern generator scaffold
+- [x] Automation helper composer scaffold
+- [x] Scene performance helper scaffold
+- [x] Live safety rails locklist scaffold
+- [x] Project quality check scaffold
+- [x] Reference track workflow scaffold
+- [x] Batch export pipeline scaffold
+- [x] Session preferences memory scaffold
+- [x] Voice command ingestion scaffold
+- [x] Semantic plugin control scaffold
+- [x] Collaboration handoff summary scaffold
+- [x] Learning explanation mode scaffold
+- [x] Template/pack manager scaffold
+- [x] Show mode checklist scaffold
+- [x] External ecosystem hooks scaffold
