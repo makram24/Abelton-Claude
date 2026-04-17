@@ -1,0 +1,25 @@
+{
+  "name": "claude-ableton-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that bridges Claude Desktop to Ableton via AbletonOSC.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test tests"
+  },
+  "keywords": [
+    "mcp",
+    "ableton",
+    "osc",
+    "claude"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "osc": "^2.4.5",
+    "zod": "^3.24.1"
+  }
+}
