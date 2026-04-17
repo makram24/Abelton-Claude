@@ -114,6 +114,17 @@ const externalHooks = {
 };
 const arrangementSectionMap = new Map();
 const arrangementSectionProfiles = new Map();
+const reactiveRules = new Map();
+const macroRegistry = new Map();
+const macroSchedule = new Map();
+const sessionGoals = new Map();
+const setlistRegistry = new Map();
+const collaboratorModes = new Map([
+  ["producer", { role: "admin", performanceMode: false }],
+  ["mixer", { role: "operator", performanceMode: false }],
+  ["performer", { role: "operator", performanceMode: true }],
+  ["observer", { role: "observer", performanceMode: false }]
+]);
 
 const OSC_ENDPOINT_VARIANTS = {
   renderAudio: ["/live/song/export_audio", "/live/song/render_audio", "/live/song/export"],
@@ -3313,6 +3324,52 @@ function buildMidiNotePlan({ key, scale, bars, density, octave }) {
   return notes;
 }
 
+function extractClipNotes(raw) {
+  if (!Array.isArray(raw)) return [];
+  const notes = [];
+
+  for (const entry of raw) {
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const pitch = Number(entry.pitch);
+      const start = Number(entry.start);
+      const duration = Number(entry.duration);
+      const velocity = Number(entry.velocity ?? 100);
+      const mute = Boolean(entry.mute ?? false);
+      if (Number.isFinite(pitch) && Number.isFinite(start) && Number.isFinite(duration)) {
+        notes.push({ pitch, start, duration, velocity, mute });
+      }
+      continue;
+    }
+    if (Array.isArray(entry) && entry.length >= 5) {
+      const [pitch, start, duration, velocity, mute] = entry;
+      if (Number.isFinite(Number(pitch)) && Number.isFinite(Number(start)) && Number.isFinite(Number(duration))) {
+        notes.push({
+          pitch: Number(pitch),
+          start: Number(start),
+          duration: Number(duration),
+          velocity: Number(velocity ?? 100),
+          mute: Boolean(mute ?? false)
+        });
+      }
+    }
+  }
+
+  if (notes.length > 0) return notes;
+
+  // Fallback for flat numeric arrays: [pitch,start,duration,velocity,mute,...]
+  for (let i = 0; i + 4 < raw.length; i += 5) {
+    const pitch = Number(raw[i]);
+    const start = Number(raw[i + 1]);
+    const duration = Number(raw[i + 2]);
+    const velocity = Number(raw[i + 3] ?? 100);
+    const mute = Boolean(raw[i + 4] ?? false);
+    if (Number.isFinite(pitch) && Number.isFinite(start) && Number.isFinite(duration)) {
+      notes.push({ pitch, start, duration, velocity, mute });
+    }
+  }
+  return notes;
+}
+
 server.registerTool(
   "compile_musical_intent",
   {
@@ -4271,6 +4328,1252 @@ server.registerTool(
       if (releaseTrackerEnabled !== undefined) externalHooks.releaseTrackerEnabled = releaseTrackerEnabled;
       if (backupEnabled !== undefined) externalHooks.backupEnabled = backupEnabled;
       return textResult({ ok: true, externalHooks });
+    })
+);
+
+server.registerTool(
+  "run_auto_mix_pass",
+  {
+    title: "Run Auto Mix Pass",
+    description: "Run a rough automatic mix pass across sampled tracks.",
+    inputSchema: {
+      sampleTracks: z.number().int().min(1).max(32).optional().default(8),
+      targetLevel: z.number().min(0.4).max(0.9).optional().default(0.78),
+      detectRoles: z.boolean().optional().default(true)
+    }
+  },
+  async ({ sampleTracks, targetLevel, detectRoles }) =>
+    withMetrics("run_auto_mix_pass", async () => {
+      const sid = `auto_mix_${Date.now()}`;
+      const snapshot = await captureRollbackSnapshotInternal(sid);
+      const tracks = await getTracksSnapshot();
+      const writes = [];
+      const roleAssignments = [];
+      for (const t of tracks.tracks.slice(0, sampleTracks)) {
+        let role = "music";
+        if (detectRoles) {
+          const n = normalizeName(t.name);
+          role = n.includes("kick")
+            ? "kick"
+            : n.includes("bass")
+              ? "bass"
+              : n.includes("vocal") || n.includes("vox")
+                ? "vocal"
+                : n.includes("lead")
+                  ? "lead"
+                  : "music";
+        }
+        roleAssignments.push({ trackIndex: t.index, name: t.name, role });
+        const roleOffset =
+          role === "kick" ? 0.05 : role === "bass" ? 0.03 : role === "vocal" ? 0.02 : role === "lead" ? 0.01 : -0.02;
+        const shaped = Number((targetLevel + roleOffset - (t.index % 2) * 0.02).toFixed(3));
+        writes.push(
+          sendPlanRaw("/live/track/set/volume", [intArg(t.index), floatArg(Math.max(0.2, Math.min(1, shaped)))], {
+            trackIndex: t.index,
+            role
+          })
+        );
+        const pan =
+          role === "kick" || role === "bass" || role === "vocal"
+            ? 0
+            : t.index % 2 === 0
+              ? -0.12
+              : 0.12;
+        writes.push(
+          sendPlanRaw("/live/track/set/panning", [intArg(t.index), floatArg(pan)], {
+            trackIndex: t.index,
+            role
+          })
+        );
+      }
+      return textResult({
+        ok: true,
+        snapshotId: snapshot.snapshotId,
+        writes,
+        sampleTracks,
+        targetLevel,
+        roleAssignments
+      });
+    })
+);
+
+server.registerTool(
+  "build_vocal_chain",
+  {
+    title: "Build Vocal Chain",
+    description: "Scaffold vocal chain setup and parameter recommendations.",
+    inputSchema: {
+      trackName: z.string().min(1).max(128),
+      style: z.enum(["pop", "rap", "indie", "electronic"]).optional().default("pop")
+    }
+  },
+  async ({ trackName, style }) =>
+    withMetrics("build_vocal_chain", async () =>
+      textResult({
+        ok: true,
+        trackName,
+        style,
+        chain: ["HPF EQ", "De-esser", "Compressor", "Saturation", "Delay Send", "Reverb Send"]
+      })
+    )
+);
+
+server.registerTool(
+  "repair_clip_timing",
+  {
+    title: "Repair Clip Timing",
+    description: "Scaffold clip timing correction recommendations.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0),
+      clipIndex: z.number().int().min(0),
+      strength: z.number().min(0).max(1).optional().default(0.7)
+    }
+  },
+  async ({ trackIndex, clipIndex, strength }) =>
+    withMetrics("repair_clip_timing", async () =>
+      textResult({
+        ok: true,
+        trackIndex,
+        clipIndex,
+        strength,
+        recommendation: "Apply quantize then nudge groove timing by analyzed offset."
+      })
+    )
+);
+
+server.registerTool(
+  "build_transition_between_sections",
+  {
+    title: "Build Transition Between Sections",
+    description: "Generate transition plan between two named sections.",
+    inputSchema: {
+      fromSection: z.string().min(1).max(64),
+      toSection: z.string().min(1).max(64),
+      bars: z.number().int().min(1).max(16).optional().default(4)
+    }
+  },
+  async ({ fromSection, toSection, bars }) =>
+    withMetrics("build_transition_between_sections", async () =>
+      textResult({
+        ok: true,
+        fromSection,
+        toSection,
+        bars,
+        actions: ["Riser automation", "Drum fill trigger", "Bass low-cut sweep", "Reverb tail throw"]
+      })
+    )
+);
+
+server.registerTool(
+  "shape_section_energy",
+  {
+    title: "Shape Section Energy",
+    description: "Apply section-level energy shaping scaffold.",
+    inputSchema: {
+      sectionName: z.string().min(1).max(64),
+      targetEnergy: z.enum(["low", "medium", "high"])
+    }
+  },
+  async ({ sectionName, targetEnergy }) =>
+    withMetrics("shape_section_energy", async () =>
+      textResult({
+        ok: true,
+        sectionName,
+        targetEnergy,
+        recipe:
+          targetEnergy === "low"
+            ? ["Lower hats", "Reduce high shelf", "Cut reverb send"]
+            : targetEnergy === "medium"
+              ? ["Moderate drum bus", "Balanced mids", "Controlled FX"]
+              : ["Boost drum bus", "Open filters", "Increase send FX"]
+      })
+    )
+);
+
+server.registerTool(
+  "configure_adaptive_macro_performer",
+  {
+    title: "Configure Adaptive Macro Performer",
+    description: "Create performance macro mapping scaffold for knobs.",
+    inputSchema: {
+      macroName: z.string().min(1).max(128),
+      mappings: z
+        .array(
+          z.object({
+            knob: z.number().int().min(1).max(8),
+            target: z.string().min(1).max(128),
+            min: z.number().min(0).max(1),
+            max: z.number().min(0).max(1)
+          })
+        )
+        .min(1)
+    }
+  },
+  async ({ macroName, mappings }) =>
+    withMetrics("configure_adaptive_macro_performer", async () => {
+      macroRegistry.set(normalizeName(macroName), { name: macroName, mappings, type: "adaptive-performer" });
+      return textResult({ ok: true, macro: macroRegistry.get(normalizeName(macroName)) });
+    })
+);
+
+server.registerTool(
+  "auto_gain_stage_tracks",
+  {
+    title: "Auto Gain Stage Tracks",
+    description: "Auto-adjust sampled track gains toward target range.",
+    inputSchema: {
+      sampleTracks: z.number().int().min(1).max(64).optional().default(16),
+      target: z.number().min(0.5).max(0.9).optional().default(0.75)
+    }
+  },
+  async ({ sampleTracks, target }) =>
+    withMetrics("auto_gain_stage_tracks", async () => {
+      const tracks = await getTracksSnapshot();
+      const writes = [];
+      for (const t of tracks.tracks.slice(0, sampleTracks)) {
+        try {
+          const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+          const current = Number(parseOscValue(vol.response, target));
+          const next = Number((current * 0.5 + target * 0.5).toFixed(4));
+          writes.push(
+            sendPlanRaw("/live/track/set/volume", [intArg(t.index), floatArg(next)], { trackIndex: t.index, current, next })
+          );
+        } catch {
+          // keep best-effort
+        }
+      }
+      return textResult({ ok: true, writes, target, sampleTracks });
+    })
+);
+
+server.registerTool(
+  "create_bus_architecture",
+  {
+    title: "Create Bus Architecture",
+    description: "Create bus architecture scaffold and routing plan.",
+    inputSchema: { includeVocals: z.boolean().optional().default(true) }
+  },
+  async ({ includeVocals }) =>
+    withMetrics("create_bus_architecture", async () => {
+      const busses = includeVocals ? ["DRUM BUS", "MUSIC BUS", "VOCAL BUS"] : ["DRUM BUS", "MUSIC BUS"];
+      const tracks = await getTracksSnapshot();
+      const writes = [];
+      for (const t of tracks.tracks.slice(0, 24)) {
+        const n = normalizeName(t.name);
+        const bus = n.includes("kick") || n.includes("snare") || n.includes("drum")
+          ? "DRUM BUS"
+          : n.includes("vocal") || n.includes("vox")
+            ? "VOCAL BUS"
+            : "MUSIC BUS";
+        if (!includeVocals && bus === "VOCAL BUS") continue;
+        writes.push(
+          await sendKnownRaw(
+            "trackSetRouting",
+            ["/live/track/set/routing"],
+            [intArg(t.index), stringArg(bus), stringArg("PREMASTER")],
+            { trackIndex: t.index, trackName: t.name, bus }
+          )
+        );
+      }
+      return textResult({
+        ok: true,
+        busses,
+        routingPlan: "Route groups to PREMASTER then MASTER.",
+        writes
+      });
+    })
+);
+
+server.registerTool(
+  "set_latency_safe_recording_mode",
+  {
+    title: "Set Latency Safe Recording Mode",
+    description: "Toggle low-latency recording behavior scaffold.",
+    inputSchema: { enabled: z.boolean() }
+  },
+  async ({ enabled }) =>
+    withMetrics("set_latency_safe_recording_mode", async () =>
+      textResult({
+        ok: true,
+        enabled,
+        actions: enabled
+          ? ["Disable heavy FX chains", "Set low buffer profile", "Arm recording tracks"]
+          : ["Re-enable FX chains", "Restore mixing buffer profile"]
+      })
+    )
+);
+
+server.registerTool(
+  "arrangement_completion_assistant",
+  {
+    title: "Arrangement Completion Assistant",
+    description: "Identify missing structure blocks and propose completion.",
+    inputSchema: { targetStyle: z.string().min(1).max(64).optional().default("electronic") }
+  },
+  async ({ targetStyle }) =>
+    withMetrics("arrangement_completion_assistant", async () =>
+      textResult({
+        ok: true,
+        targetStyle,
+        missingCandidates: ["Intro", "Breakdown", "Outro"],
+        proposedPlan: ["Add 8-bar intro", "Add 16-bar breakdown before final drop"]
+      })
+    )
+);
+
+server.registerTool(
+  "detect_track_roles",
+  {
+    title: "Detect Track Roles",
+    description: "Detect probable roles from track names.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("detect_track_roles", async () => {
+      const tracks = await getTracksSnapshot();
+      const roles = tracks.tracks.map((t) => {
+        const n = normalizeName(t.name);
+        const role = n.includes("kick")
+          ? "kick"
+          : n.includes("bass")
+            ? "bass"
+            : n.includes("vox") || n.includes("vocal")
+              ? "vocal"
+              : n.includes("lead")
+                ? "lead"
+                : "music";
+        return { trackIndex: t.index, name: t.name, role };
+      });
+      return textResult({ ok: true, roles });
+    })
+);
+
+server.registerTool(
+  "run_release_prep_pipeline",
+  {
+    title: "Run Release Prep Pipeline",
+    description: "Run release prep checklist and optional deliverables export matrix.",
+    inputSchema: {
+      baseDirectory: z.string().min(1).max(512),
+      autoStartExports: z.boolean().optional().default(false),
+      maxWarnings: z.number().int().min(0).max(20).optional().default(0),
+      force: z.boolean().optional().default(false),
+      confirmToken: z.string().optional()
+    }
+  },
+  async ({ baseDirectory, autoStartExports, maxWarnings, force, confirmToken }) =>
+    withMetrics("run_release_prep_pipeline", async () => {
+      const guardrailData = await (async () => {
+        const tempo = await requestKnown("tempoGet", ["/live/song/get/tempo", "/live/song/tempo"]);
+        const playing = await requestKnown("isPlayingGet", [
+          "/live/song/get/is_playing",
+          "/live/song/is_playing"
+        ]);
+        const tracks = await getTracksSnapshot();
+        const vols = [];
+        for (const t of tracks.tracks.slice(0, 16)) {
+          try {
+            const v = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+            vols.push(Number(parseOscValue(v.response, 0.85)));
+          } catch {
+            // ignore
+          }
+        }
+        const high = vols.filter((v) => v > 0.95).length;
+        const warnings = [];
+        if (high > 0) warnings.push(`High-volume tracks detected: ${high}`);
+        if (Boolean(parseOscValue(playing.response, 0))) warnings.push("Transport currently playing.");
+        return {
+          tempo: Number(parseOscValue(tempo.response, 120)),
+          isPlaying: Boolean(parseOscValue(playing.response, 0)),
+          warnings
+        };
+      })();
+
+      const blockedByGuardrails = guardrailData.warnings.length > maxWarnings && !force;
+      if (blockedByGuardrails) {
+        return textResult({
+          ok: false,
+          blocked: true,
+          reason: "Guardrail warning threshold exceeded.",
+          maxWarnings,
+          warningCount: guardrailData.warnings.length,
+          force,
+          guardrails: guardrailData,
+          nextStep: "Set force=true to proceed anyway, or resolve warnings first."
+        });
+      }
+
+      const targets = [
+        { profileName: "mastering-print", targetPath: `${baseDirectory}/master.wav` },
+        { profileName: "streaming", targetPath: `${baseDirectory}/streaming.wav` },
+        { profileName: "mix-engineer-stems", targetPath: `${baseDirectory}/stems` }
+      ];
+      const matrixJobs = [];
+      for (const t of targets) {
+        const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const job = {
+          jobId,
+          status: "queued",
+          profileName: t.profileName,
+          targetPath: t.targetPath,
+          createdAt: new Date().toISOString()
+        };
+        exportJobs.set(jobId, job);
+        matrixJobs.push(job);
+        if (autoStartExports) {
+          guardDestructive(confirmToken);
+          const profile = exportProfiles.get(t.profileName);
+          job.status = "running";
+          if (profile?.type === "stems") {
+            await sendKnownRaw(
+              "renderStems",
+              ["/live/song/export_stems"],
+              [stringArg(t.targetPath), toBoolInt(profile.includeReturns)],
+              { destructive: true, jobId }
+            );
+          } else {
+            await sendKnownRaw(
+              "renderAudio",
+              ["/live/song/export_audio"],
+              [stringArg(t.targetPath), toBoolInt(true), toBoolInt(false)],
+              { destructive: true, jobId }
+            );
+          }
+          job.status = "completed";
+          job.completedAt = new Date().toISOString();
+        }
+      }
+
+      if (autoStartExports) guardDestructive(confirmToken);
+      return textResult({
+        ok: guardrailData.warnings.length === 0,
+        blocked: false,
+        baseDirectory,
+        autoStartExports,
+        maxWarnings,
+        force,
+        steps: ["Guardrails checked", "Deliverables matrix generated", "Release report prepared"],
+        guardrails: guardrailData,
+        matrix: { targets, jobs: matrixJobs }
+      });
+    })
+);
+
+server.registerTool(
+  "smart_sample_audit",
+  {
+    title: "Smart Sample Audit",
+    description: "Run sample audit scaffold for missing/unused/duplicate samples.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("smart_sample_audit", async () =>
+      textResult({
+        ok: true,
+        findings: ["No filesystem scan in scaffold mode", "Integrate project sample index provider next"]
+      })
+    )
+);
+
+server.registerTool(
+  "schedule_macro_timeline",
+  {
+    title: "Schedule Macro Timeline",
+    description: "Schedule macro trigger at bar position.",
+    inputSchema: {
+      macroName: z.string().min(1).max(128),
+      bar: z.number().int().min(1),
+      enabled: z.boolean().optional().default(true)
+    }
+  },
+  async ({ macroName, bar, enabled }) =>
+    withMetrics("schedule_macro_timeline", async () => {
+      const key = `${normalizeName(macroName)}@${bar}`;
+      macroSchedule.set(key, { macroName, bar, enabled, updatedAt: new Date().toISOString() });
+      return textResult({ ok: true, schedule: macroSchedule.get(key) });
+    })
+);
+
+server.registerTool(
+  "configure_live_improv_guardrails",
+  {
+    title: "Configure Live Improv Guardrails",
+    description: "Set improv safety behavior and autosnapshot cadence scaffold.",
+    inputSchema: {
+      enabled: z.boolean(),
+      autoSnapshotBars: z.number().int().min(1).max(128).optional().default(8)
+    }
+  },
+  async ({ enabled, autoSnapshotBars }) =>
+    withMetrics("configure_live_improv_guardrails", async () => {
+      liveSafetyState.enabled = enabled;
+      return textResult({ ok: true, enabled, autoSnapshotBars, liveSafetyState });
+    })
+);
+
+server.registerTool(
+  "diagnose_mix_issue",
+  {
+    title: "Diagnose Mix Issue",
+    description: "Map problem statements to concrete remediation suggestions.",
+    inputSchema: { issue: z.string().min(1).max(256) }
+  },
+  async ({ issue }) =>
+    withMetrics("diagnose_mix_issue", async () => {
+      const i = issue.toLowerCase();
+      const suggestions = i.includes("kick") && i.includes("bass")
+        ? ["Sidechain bass to kick", "Cut 50-80Hz on bass slightly", "Shorten kick tail"]
+        : i.includes("mud")
+          ? ["Reduce 200-400Hz bus buildup", "High-pass non-bass elements"]
+          : ["Check gain staging", "Check arrangement density", "A/B with reference"];
+      return textResult({ ok: true, issue, suggestions });
+    })
+);
+
+server.registerTool(
+  "optimize_plugin_chain",
+  {
+    title: "Optimize Plugin Chain",
+    description: "Suggest CPU/latency optimization scaffold for plugin chains.",
+    inputSchema: { trackName: z.string().min(1).max(128) }
+  },
+  async ({ trackName }) =>
+    withMetrics("optimize_plugin_chain", async () =>
+      textResult({
+        ok: true,
+        trackName,
+        optimizations: [
+          "Move linear-phase processors to mixdown stage",
+          "Freeze heavy synth tracks",
+          "Consolidate redundant EQ instances"
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "set_session_goal",
+  {
+    title: "Set Session Goal",
+    description: "Create guided session goal and checkpoints.",
+    inputSchema: {
+      goalName: z.string().min(1).max(128),
+      minutes: z.number().int().min(5).max(300)
+    }
+  },
+  async ({ goalName, minutes }) =>
+    withMetrics("set_session_goal", async () => {
+      sessionGoals.set(normalizeName(goalName), {
+        goalName,
+        minutes,
+        checkpoints: ["Plan", "Execute", "Review"],
+        createdAt: new Date().toISOString()
+      });
+      return textResult({ ok: true, goal: sessionGoals.get(normalizeName(goalName)) });
+    })
+);
+
+server.registerTool(
+  "manage_setlist",
+  {
+    title: "Manage Setlist",
+    description: "Manage multi-song setlist scaffold entries.",
+    inputSchema: {
+      action: z.enum(["add", "remove", "list"]),
+      songName: z.string().min(1).max(128).optional()
+    }
+  },
+  async ({ action, songName }) =>
+    withMetrics("manage_setlist", async () => {
+      const key = "default";
+      const current = setlistRegistry.get(key) ?? [];
+      if (action === "add") {
+        if (!songName) throw new Error("songName required for add.");
+        current.push(songName);
+        setlistRegistry.set(key, current);
+      } else if (action === "remove") {
+        if (!songName) throw new Error("songName required for remove.");
+        setlistRegistry.set(
+          key,
+          current.filter((s) => normalizeName(s) !== normalizeName(songName))
+        );
+      }
+      return textResult({ ok: true, songs: setlistRegistry.get(key) ?? [] });
+    })
+);
+
+server.registerTool(
+  "export_session_documentation",
+  {
+    title: "Export Session Documentation",
+    description: "Generate session documentation summary from runtime metrics and context.",
+    inputSchema: {
+      note: z.string().max(500).optional()
+    }
+  },
+  async ({ note }) =>
+    withMetrics("export_session_documentation", async () =>
+      textResult({
+        ok: true,
+        generatedAt: new Date().toISOString(),
+        summary: {
+          totalCommands: metrics.totalCommands,
+          failedCommands: metrics.failedCommands,
+          lastError: metrics.lastError
+        },
+        note: note ?? null
+      })
+    )
+);
+
+server.registerTool(
+  "upsert_reactive_rule",
+  {
+    title: "Upsert Reactive Rule",
+    description: "Save a reactive automation rule for real-time trigger scaffolding.",
+    inputSchema: {
+      ruleName: z.string().min(1).max(128),
+      trigger: z.string().min(1).max(128),
+      action: z.string().min(1).max(128),
+      enabled: z.boolean().optional().default(true)
+    }
+  },
+  async ({ ruleName, trigger, action, enabled }) =>
+    withMetrics("upsert_reactive_rule", async () => {
+      reactiveRules.set(normalizeName(ruleName), {
+        ruleName,
+        trigger,
+        action,
+        enabled,
+        updatedAt: new Date().toISOString()
+      });
+      return textResult({ ok: true, rule: reactiveRules.get(normalizeName(ruleName)) });
+    })
+);
+
+server.registerTool(
+  "list_reactive_rules",
+  { title: "List Reactive Rules", description: "List saved reactive rules." },
+  async () => withMetrics("list_reactive_rules", async () => textResult({ rules: Object.fromEntries(reactiveRules) }))
+);
+
+server.registerTool(
+  "comp_take_assistant",
+  {
+    title: "Comp Take Assistant",
+    description: "Create take comping recommendations scaffold for a track.",
+    inputSchema: {
+      trackName: z.string().min(1).max(128),
+      strategy: z.enum(["best-energy", "best-pitch", "hybrid"]).optional().default("hybrid")
+    }
+  },
+  async ({ trackName, strategy }) =>
+    withMetrics("comp_take_assistant", async () =>
+      textResult({
+        ok: true,
+        trackName,
+        strategy,
+        recommendations: [
+          "Use first phrase from Take 2 for clean attack.",
+          "Use sustain from Take 4 for stable tail.",
+          "Apply 20ms crossfade at each comp boundary."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "setup_sidechain_bus",
+  {
+    title: "Setup Sidechain Bus",
+    description: "Scaffold sidechain routing setup from trigger track to target tracks.",
+    inputSchema: {
+      triggerTrackName: z.string().min(1).max(128),
+      targetTrackNames: z.array(z.string().min(1).max(128)).min(1),
+      amount: z.number().min(0).max(1).optional().default(0.6)
+    }
+  },
+  async ({ triggerTrackName, targetTrackNames, amount }) =>
+    withMetrics("setup_sidechain_bus", async () => {
+      const trigger = await resolveTrackIndexFromName(triggerTrackName, 0.5);
+      const targets = [];
+      for (const targetName of targetTrackNames) {
+        const resolved = await resolveTrackIndexFromName(targetName, 0.5);
+        targets.push({ requested: targetName, resolved });
+      }
+
+      const writes = [];
+      for (const t of targets) {
+        // Best-effort: set routing metadata and compressor-like params on device 0.
+        writes.push(
+          await sendKnownRaw(
+            "trackSetRouting",
+            ["/live/track/set/routing"],
+            [
+              intArg(t.resolved.index),
+              stringArg(`SC_IN:${trigger.name}`),
+              stringArg("MASTER")
+            ],
+            {
+              targetTrack: t.resolved,
+              triggerTrack: trigger
+            }
+          )
+        );
+        writes.push(
+          sendPlanRaw(
+            "/live/device/set/parameter/value",
+            [intArg(t.resolved.index), intArg(0), intArg(2), floatArg(Math.max(0.05, 0.9 - amount * 0.8))],
+            { targetTrack: t.resolved, parameter: "sidechain-threshold-proxy" }
+          )
+        );
+        writes.push(
+          sendPlanRaw(
+            "/live/device/set/parameter/value",
+            [intArg(t.resolved.index), intArg(0), intArg(3), floatArg(0.2 + amount * 0.7)],
+            { targetTrack: t.resolved, parameter: "sidechain-release-proxy" }
+          )
+        );
+      }
+
+      return textResult({
+        ok: true,
+        triggerTrack: trigger,
+        targets,
+        amount,
+        writes
+      });
+    })
+);
+
+server.registerTool(
+  "semantic_clip_edit",
+  {
+    title: "Semantic Clip Edit",
+    description: "Interpret a semantic edit command and return executable clip-edit plan.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0),
+      clipIndex: z.number().int().min(0),
+      prompt: z.string().min(1).max(256),
+      applyWrites: z.boolean().optional().default(true),
+      maxNotes: z.number().int().min(1).max(4096).optional().default(1024),
+      replaceMode: z.boolean().optional().default(false)
+    }
+  },
+  async ({ trackIndex, clipIndex, prompt, applyWrites, maxNotes, replaceMode }) =>
+    withMetrics("semantic_clip_edit", async () => {
+      const p = prompt.toLowerCase();
+      const noteResp = await requestAny(["/live/clip/get/notes", "/live/clip/get/notes_extended"], [
+        intArg(trackIndex),
+        intArg(clipIndex)
+      ]);
+      const raw = parseOscValue(noteResp.response, []);
+      let notes = extractClipNotes(raw).slice(0, maxNotes);
+      const editOps = [];
+
+      if (p.includes("tighter") || p.includes("quantize")) {
+        notes = notes.map((n) => ({ ...n, start: Math.round(n.start * 4) / 4 }));
+        editOps.push("quantize_1_16");
+      }
+      if (p.includes("swing")) {
+        notes = notes.map((n) => {
+          const step = Math.round(n.start * 4);
+          const isOff = step % 2 === 1;
+          return { ...n, start: Number((n.start + (isOff ? 0.03 : 0)).toFixed(4)) };
+        });
+        editOps.push("swing_push_offbeats");
+      }
+      if (p.includes("less busy") || p.includes("simpler")) {
+        const keep = Math.max(1, Math.floor(notes.length * 0.7));
+        notes = [...notes]
+          .sort((a, b) => (b.velocity ?? 100) - (a.velocity ?? 100))
+          .slice(0, keep)
+          .sort((a, b) => a.start - b.start);
+        editOps.push("density_reduce_30pct");
+      }
+      if (p.includes("more busy") || p.includes("denser")) {
+        const clones = notes.slice(0, Math.min(notes.length, 64)).map((n) => ({
+          ...n,
+          start: Number((n.start + 0.25).toFixed(4)),
+          velocity: Math.max(1, Math.min(127, (n.velocity ?? 100) - 8))
+        }));
+        notes = [...notes, ...clones].sort((a, b) => a.start - b.start);
+        editOps.push("density_increase_clone_shift");
+      }
+      if (editOps.length === 0) {
+        editOps.push("no_transform_match");
+      }
+
+      const writes = [];
+      let clearResult = null;
+      if (applyWrites) {
+        if (replaceMode) {
+          // Best-effort clear before rewrite; endpoint names vary across AbletonOSC builds.
+          const clearCandidates = [
+            "/live/clip/remove/notes",
+            "/live/clip/remove_notes",
+            "/live/clip/clear_notes",
+            "/live/clip/remove_all_notes"
+          ];
+          try {
+            const selected = await selectEndpoint("clipClearNotes", clearCandidates, [
+              intArg(trackIndex),
+              intArg(clipIndex)
+            ]);
+            clearResult = sendPlanRaw(selected, [intArg(trackIndex), intArg(clipIndex)], {
+              trackIndex,
+              clipIndex,
+              replaceMode: true,
+              clearEndpoint: selected
+            });
+          } catch (clearError) {
+            clearResult = {
+              ok: false,
+              replaceMode: true,
+              warning:
+                "No clip clear-notes endpoint resolved; falling back to additive write mode.",
+              error: clearError.message
+            };
+          }
+        }
+        for (const n of notes) {
+          writes.push(
+            sendPlanRaw("/live/clip/add_note", [
+              intArg(trackIndex),
+              intArg(clipIndex),
+              intArg(n.pitch),
+              floatArg(n.start),
+              floatArg(n.duration),
+              intArg(Math.max(1, Math.min(127, Math.round(n.velocity ?? 100)))),
+              intArg(n.mute ? 1 : 0)
+            ])
+          );
+        }
+      }
+
+      return textResult({
+        ok: true,
+        trackIndex,
+        clipIndex,
+        prompt,
+        endpoint: noteResp.address,
+        editOps,
+        inputNotes: extractClipNotes(raw).length,
+        outputNotes: notes.length,
+        replaceMode,
+        clearResult,
+        writesApplied: applyWrites,
+        writesCount: writes.length
+      });
+    })
+);
+
+server.registerTool(
+  "harmony_arranger",
+  {
+    title: "Harmony Arranger",
+    description: "Generate section-wise harmonic plan scaffold.",
+    inputSchema: {
+      key: z.string().min(1).max(3),
+      scale: z.enum(["major", "minor"]),
+      sections: z.array(z.string().min(1).max(64)).min(1)
+    }
+  },
+  async ({ key, scale, sections }) =>
+    withMetrics("harmony_arranger", async () =>
+      textResult({
+        ok: true,
+        key,
+        scale,
+        sections: sections.map((s, i) => ({
+          section: s,
+          suggestedProgression: i % 2 === 0 ? "i-VI-III-VII" : "i-iv-VII-III"
+        }))
+      })
+    )
+);
+
+server.registerTool(
+  "humanize_drums",
+  {
+    title: "Humanize Drums",
+    description: "Apply drum humanization scaffold settings.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0),
+      clipIndex: z.number().int().min(0),
+      timingMs: z.number().min(0).max(40).optional().default(12),
+      velocitySpread: z.number().int().min(0).max(40).optional().default(18)
+    }
+  },
+  async ({ trackIndex, clipIndex, timingMs, velocitySpread }) =>
+    withMetrics("humanize_drums", async () =>
+      textResult({ ok: true, trackIndex, clipIndex, timingMs, velocitySpread })
+    )
+);
+
+server.registerTool(
+  "apply_fx_chain_template",
+  {
+    title: "Apply FX Chain Template",
+    description: "Apply and validate FX chain template scaffold.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0),
+      templateName: z.string().min(1).max(128)
+    }
+  },
+  async ({ trackIndex, templateName }) =>
+    withMetrics("apply_fx_chain_template", async () =>
+      textResult({
+        ok: true,
+        trackIndex,
+        templateName,
+        validation: ["Check device availability", "Check routing compatibility", "Check parameter defaults"]
+      })
+    )
+);
+
+server.registerTool(
+  "run_master_bus_guardrails",
+  {
+    title: "Run Master Bus Guardrails",
+    description: "Master bus readiness checks scaffold before export.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_master_bus_guardrails", async () => {
+      const tempo = await requestKnown("tempoGet", ["/live/song/get/tempo", "/live/song/tempo"]);
+      const playing = await requestKnown("isPlayingGet", [
+        "/live/song/get/is_playing",
+        "/live/song/is_playing"
+      ]);
+      const tracks = await getTracksSnapshot();
+      const volumes = [];
+      for (const t of tracks.tracks.slice(0, 16)) {
+        try {
+          const v = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+          volumes.push({ trackIndex: t.index, name: t.name, volume: Number(parseOscValue(v.response, 0.85)) });
+        } catch {
+          // ignore missing data
+        }
+      }
+
+      const hot = volumes.filter((v) => v.volume > 0.95);
+      const veryLow = volumes.filter((v) => v.volume < 0.1);
+      const warnings = [];
+      if (hot.length > 0) warnings.push(`Potential clipping risk on ${hot.length} tracks (>0.95 volume).`);
+      if (veryLow.length > 0) warnings.push(`${veryLow.length} tracks are very low (<0.10); verify gain staging.`);
+      if (Boolean(parseOscValue(playing.response, 0))) {
+        warnings.push("Transport is currently playing; avoid destructive export changes mid-playback.");
+      }
+      if (metrics.failedCommands > 0) {
+        warnings.push(`There are ${metrics.failedCommands} failed commands in current uptime metrics.`);
+      }
+
+      return textResult({
+        ok: warnings.length === 0,
+        tempo: Number(parseOscValue(tempo.response, 120)),
+        isPlaying: Boolean(parseOscValue(playing.response, 0)),
+        trackSampled: volumes.length,
+        checks: {
+          highVolumeTracks: hot,
+          veryLowVolumeTracks: veryLow,
+          exportProfilesAvailable: [...exportProfiles.keys()]
+        },
+        warnings
+      });
+    })
+);
+
+server.registerTool(
+  "prepare_stems_one_click",
+  {
+    title: "Prepare Stems One Click",
+    description: "Scaffold stem prep: naming, grouping, and render prep.",
+    inputSchema: {
+      namingPrefix: z.string().min(1).max(64).optional().default("STEM"),
+      includeReturns: z.boolean().optional().default(true)
+    }
+  },
+  async ({ namingPrefix, includeReturns }) =>
+    withMetrics("prepare_stems_one_click", async () =>
+      textResult({ ok: true, namingPrefix, includeReturns, next: "Call export_batch_profiles or render_stems." })
+    )
+);
+
+server.registerTool(
+  "session_diff_undo_bundle",
+  {
+    title: "Session Diff Undo Bundle",
+    description: "Summarize recent command delta and suggest grouped rollback steps.",
+    inputSchema: { lastN: z.number().int().min(1).max(100).optional().default(10) }
+  },
+  async ({ lastN }) =>
+    withMetrics("session_diff_undo_bundle", async () =>
+      textResult({
+        ok: true,
+        lastN,
+        summary: `Review last ${lastN} audit entries in logs/audit.jsonl and consider undo/restore snapshot.`
+      })
+    )
+);
+
+server.registerTool(
+  "auto_scene_sequencer",
+  {
+    title: "Auto Scene Sequencer",
+    description: "Build scene sequencing scaffold with transition timings.",
+    inputSchema: {
+      scenes: z.array(z.number().int().min(0)).min(1),
+      barsPerScene: z.number().int().min(1).max(128).optional().default(8)
+    }
+  },
+  async ({ scenes, barsPerScene }) =>
+    withMetrics("auto_scene_sequencer", async () =>
+      textResult({
+        ok: true,
+        sequence: scenes.map((s, idx) => ({ sceneIndex: s, startBars: idx * barsPerScene, bars: barsPerScene }))
+      })
+    )
+);
+
+server.registerTool(
+  "create_panic_macro",
+  {
+    title: "Create Panic Macro",
+    description: "Create/update panic macro and optionally activate it immediately.",
+    inputSchema: { activateNow: z.boolean().optional().default(false) }
+  },
+  async ({ activateNow }) =>
+    withMetrics("create_panic_macro", async () => {
+      macroRegistry.set("panic", {
+        name: "panic",
+        actions: ["stop_all_clips", "stop_playback", "set_safety_mode:safe"]
+      });
+      if (activateNow) {
+        sendPlanRaw("/live/song/stop_all_clips", []);
+        sendPlanRaw("/live/song/stop_playing", []);
+      }
+      return textResult({ ok: true, created: true, activated: activateNow });
+    })
+);
+
+server.registerTool(
+  "run_macro",
+  {
+    title: "Run Macro",
+    description: "Run a stored macro scaffold by name.",
+    inputSchema: { macroName: z.string().min(1).max(128) }
+  },
+  async ({ macroName }) =>
+    withMetrics("run_macro", async () => {
+      const macro = macroRegistry.get(normalizeName(macroName)) ?? macroRegistry.get(macroName);
+      if (!macro) throw new Error(`Unknown macro: ${macroName}`);
+      if (normalizeName(macroName) === "panic") {
+        sendPlanRaw("/live/song/stop_all_clips", []);
+        sendPlanRaw("/live/song/stop_playing", []);
+      }
+      return textResult({ ok: true, macro });
+    })
+);
+
+server.registerTool(
+  "record_prompt_macro",
+  {
+    title: "Record Prompt Macro",
+    description: "Store prompt-to-macro mapping scaffold.",
+    inputSchema: {
+      macroName: z.string().min(1).max(128),
+      prompt: z.string().min(1).max(256),
+      actions: z.array(z.string().min(1).max(128)).min(1)
+    }
+  },
+  async ({ macroName, prompt, actions }) =>
+    withMetrics("record_prompt_macro", async () => {
+      macroRegistry.set(normalizeName(macroName), {
+        name: macroName,
+        prompt,
+        actions,
+        createdAt: new Date().toISOString()
+      });
+      return textResult({ ok: true, macro: macroRegistry.get(normalizeName(macroName)) });
+    })
+);
+
+server.registerTool(
+  "project_cleanup_bot",
+  {
+    title: "Project Cleanup Bot",
+    description: "Scan project state and suggest cleanup actions scaffold.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("project_cleanup_bot", async () =>
+      textResult({
+        ok: true,
+        suggestions: [
+          "Delete empty MIDI clips in inactive scenes.",
+          "Disable unused return chains.",
+          "Remove muted-for-long tracks after verification."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "reference_match_assistant",
+  {
+    title: "Reference Match Assistant",
+    description: "Reference tonal/dynamics matching scaffold.",
+    inputSchema: { referenceName: z.string().min(1).max(128) }
+  },
+  async ({ referenceName }) =>
+    withMetrics("reference_match_assistant", async () =>
+      textResult({
+        ok: true,
+        referenceName,
+        guidance: ["Match perceived loudness first", "Compare low-end balance", "Compare transient sharpness"]
+      })
+    )
+);
+
+server.registerTool(
+  "set_collaborator_mode",
+  {
+    title: "Set Collaborator Mode",
+    description: "Apply collaborator permission preset to runtime context.",
+    inputSchema: { mode: z.enum(["producer", "mixer", "performer", "observer"]) }
+  },
+  async ({ mode }) =>
+    withMetrics("set_collaborator_mode", async () => {
+      const preset = collaboratorModes.get(mode);
+      runtimeContext.role = preset.role;
+      runtimeContext.performanceMode = preset.performanceMode;
+      return textResult({ ok: true, mode, runtimeContext });
+    })
+);
+
+server.registerTool(
+  "task_linked_production_flow",
+  {
+    title: "Task Linked Production Flow",
+    description: "Create mapping scaffold between tasks and Ableton operations.",
+    inputSchema: {
+      taskTitle: z.string().min(1).max(200),
+      suggestedAction: z.string().min(1).max(128)
+    }
+  },
+  async ({ taskTitle, suggestedAction }) =>
+    withMetrics("task_linked_production_flow", async () =>
+      textResult({ ok: true, taskTitle, suggestedAction, externalHooks })
+    )
+);
+
+server.registerTool(
+  "voice_live_mode_command",
+  {
+    title: "Voice Live Mode Command",
+    description: "Low-latency voice command scaffold for performance context.",
+    inputSchema: { phrase: z.string().min(1).max(256) }
+  },
+  async ({ phrase }) =>
+    withMetrics("voice_live_mode_command", async () => {
+      const p = phrase.toLowerCase();
+      if (p.includes("panic") || p.includes("stop")) {
+        sendPlanRaw("/live/song/stop_all_clips", []);
+        return textResult({ ok: true, interpretedAction: "stop_all_clips" });
+      }
+      return textResult({ ok: true, interpretedAction: "compile_musical_intent", phrase });
+    })
+);
+
+server.registerTool(
+  "plugin_preset_intelligence",
+  {
+    title: "Plugin Preset Intelligence",
+    description: "Suggest preset names by semantic intent and optionally register alias.",
+    inputSchema: {
+      intent: z.string().min(1).max(128),
+      presetAlias: z.string().min(1).max(128).optional()
+    }
+  },
+  async ({ intent, presetAlias }) =>
+    withMetrics("plugin_preset_intelligence", async () => {
+      const suggestions = intent.toLowerCase().includes("warm")
+        ? ["Warm Tape Glue", "Analog Soft Saturator", "Velvet Pad Space"]
+        : ["Clean Control", "Modern Tight Bus", "Neutral Utility"];
+      if (presetAlias) {
+        presetRegistry.set(normalizeName(presetAlias), {
+          presetAlias,
+          presetName: suggestions[0],
+          updatedAt: new Date().toISOString()
+        });
+      }
+      return textResult({ ok: true, intent, suggestions, registeredAlias: presetAlias ?? null });
+    })
+);
+
+server.registerTool(
+  "export_deliverables_matrix",
+  {
+    title: "Export Deliverables Matrix",
+    description: "Create and optionally execute export jobs for common deliverables.",
+    inputSchema: {
+      baseDirectory: z.string().min(1).max(512),
+      includeStems: z.boolean().optional().default(true),
+      includeAcapella: z.boolean().optional().default(true),
+      autoStart: z.boolean().optional().default(false),
+      confirmToken: z.string().optional()
+    }
+  },
+  async ({ baseDirectory, includeStems, includeAcapella, autoStart, confirmToken }) =>
+    withMetrics("export_deliverables_matrix", async () => {
+      const targets = [
+        { profileName: "mastering-print", targetPath: `${baseDirectory}/master.wav` },
+        { profileName: "streaming", targetPath: `${baseDirectory}/streaming.wav` }
+      ];
+      if (includeStems) {
+        targets.push({ profileName: "mix-engineer-stems", targetPath: `${baseDirectory}/stems` });
+      }
+      if (includeAcapella) {
+        targets.push({ profileName: "streaming", targetPath: `${baseDirectory}/acapella.wav` });
+      }
+      const created = [];
+      for (const t of targets) {
+        const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const job = {
+          jobId,
+          status: "queued",
+          profileName: t.profileName,
+          targetPath: t.targetPath,
+          createdAt: new Date().toISOString()
+        };
+        exportJobs.set(jobId, job);
+        created.push({ jobId, ...t });
+        if (autoStart) {
+          guardDestructive(confirmToken);
+          const profile = exportProfiles.get(t.profileName);
+          job.status = "running";
+          if (profile?.type === "stems") {
+            await sendKnownRaw(
+              "renderStems",
+              ["/live/song/export_stems"],
+              [stringArg(t.targetPath), toBoolInt(profile.includeReturns)],
+              { destructive: true, jobId }
+            );
+          } else {
+            await sendKnownRaw(
+              "renderAudio",
+              ["/live/song/export_audio"],
+              [stringArg(t.targetPath), toBoolInt(true), toBoolInt(false)],
+              { destructive: true, jobId }
+            );
+          }
+          job.status = "completed";
+          job.completedAt = new Date().toISOString();
+        }
+      }
+      return textResult({ ok: true, targets, jobs: created, autoStart });
     })
 );
 

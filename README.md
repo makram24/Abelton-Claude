@@ -186,6 +186,59 @@ On startup, the server now performs an endpoint capability probe and selects the
 - `list_template_packs`
 - `run_show_mode_checklist`
 - `configure_external_hooks`
+- `upsert_reactive_rule`
+- `list_reactive_rules`
+- `comp_take_assistant`
+- `setup_sidechain_bus`
+- `semantic_clip_edit`
+- `harmony_arranger`
+- `humanize_drums`
+- `apply_fx_chain_template`
+- `run_master_bus_guardrails`
+- `prepare_stems_one_click`
+- `session_diff_undo_bundle`
+- `auto_scene_sequencer`
+- `create_panic_macro`
+- `run_macro`
+- `record_prompt_macro`
+- `project_cleanup_bot`
+- `reference_match_assistant`
+- `set_collaborator_mode`
+- `task_linked_production_flow`
+- `voice_live_mode_command`
+- `plugin_preset_intelligence`
+- `export_deliverables_matrix`
+- `run_auto_mix_pass`
+- `build_vocal_chain`
+- `repair_clip_timing`
+- `build_transition_between_sections`
+- `shape_section_energy`
+- `configure_adaptive_macro_performer`
+- `auto_gain_stage_tracks`
+- `create_bus_architecture`
+- `set_latency_safe_recording_mode`
+- `arrangement_completion_assistant`
+- `detect_track_roles`
+- `run_release_prep_pipeline`
+- `smart_sample_audit`
+- `schedule_macro_timeline`
+- `configure_live_improv_guardrails`
+- `diagnose_mix_issue`
+- `optimize_plugin_chain`
+- `set_session_goal`
+- `manage_setlist`
+- `export_session_documentation`
+
+Deeper execution notes:
+
+- `setup_sidechain_bus` now resolves trigger/target tracks by name and performs best-effort routing/parameter writes.
+- `semantic_clip_edit` now reads clip notes, applies prompt-driven transformations, and can write edited notes back.
+- `semantic_clip_edit` supports `replaceMode=true` for best-effort clear-and-rewrite (falls back safely if clear endpoint is unavailable).
+- `run_master_bus_guardrails` now evaluates measurable session checks (tempo/play state/track volume sample/warnings).
+- `run_auto_mix_pass` now supports role-aware level/pan shaping based on detected track roles.
+- `create_bus_architecture` now performs concrete routing writes using endpoint variants.
+- `run_release_prep_pipeline` now chains measurable guardrail checks with real queued/optional-start deliverables jobs.
+- `run_release_prep_pipeline` now supports guardrail fail-fast policy (`maxWarnings`) with explicit override (`force=true`).
 
 Notes on deeper execution:
 

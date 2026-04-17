@@ -110,3 +110,49 @@ This file tracks the full implementation roadmap requested for this project.
 - [x] Template/pack manager scaffold
 - [x] Show mode checklist scaffold
 - [x] External ecosystem hooks scaffold
+
+## Phase 11 - Advanced production automation
+
+- [x] Real-time reactive mode scaffold
+- [x] Smart take comping assistant scaffold
+- [x] Sidechain setup scaffold
+- [x] Semantic clip edit scaffold
+- [x] Harmony-aware arranger scaffold
+- [x] Drum humanization scaffold
+- [x] FX chain template validation scaffold
+- [x] Master bus guardrails scaffold
+- [x] One-click stem prep scaffold
+- [x] Session diff + undo bundle scaffold
+- [x] Auto scene sequencing scaffold
+- [x] Panic macro + macro runner scaffolding
+- [x] Prompt-to-macro recorder scaffold
+- [x] Project cleanup bot scaffold
+- [x] Reference match assistant scaffold
+- [x] Collaborator mode presets scaffold
+- [x] Task-linked production flow scaffold
+- [x] Voice live mode command scaffold
+- [x] Plugin preset intelligence scaffold
+- [x] Deliverables matrix export scaffold
+
+## Phase 12 - Intelligent workflow and release operations
+
+- [x] Auto mix pass scaffold
+- [x] Vocal production chain scaffold
+- [x] Clip timing repair scaffold
+- [x] Section transition builder scaffold
+- [x] Section energy shaping scaffold
+- [x] Adaptive macro performer scaffold
+- [x] Auto gain staging scaffold
+- [x] Bus architecture scaffold
+- [x] Latency-safe recording mode scaffold
+- [x] Arrangement completion assistant scaffold
+- [x] Track role detection scaffold
+- [x] Release prep pipeline scaffold
+- [x] Smart sample audit scaffold
+- [x] Macro timeline scheduler scaffold
+- [x] Live improv guardrails scaffold
+- [x] Mix issue diagnosis scaffold
+- [x] Plugin chain optimizer scaffold
+- [x] Session goals mode scaffold
+- [x] Multi-song set manager scaffold
+- [x] Auto documentation export scaffold
