@@ -228,6 +228,128 @@ On startup, the server now performs an endpoint capability probe and selects the
 - `set_session_goal`
 - `manage_setlist`
 - `export_session_documentation`
+- `ai_arrangement_rewrite`
+- `drum_replacement_assistant`
+- `resolve_kick_bass_conflict`
+- `advanced_vocal_polish`
+- `transform_genre_template`
+- `detect_section_similarity`
+- `generate_drop_builder_plan`
+- `write_dynamic_bus_automation`
+- `run_release_readiness_score`
+- `intelligent_freeze_manager`
+- `set_session_focus_mode`
+- `contextual_coaching_assistant`
+- `rank_recording_takes`
+- `reference_aware_tonal_targeting`
+- `create_creative_prompt_scene`
+- `live_performance_cue_engine`
+- `error_recovery_autopilot`
+- `set_project_memory_profile`
+- `generate_release_variants`
+- `run_post_export_qa`
+- `normalize_stem_naming`
+- `target_prerelease_loudness`
+- `find_arrangement_gaps`
+- `reinforce_hook_section`
+- `optimize_kick_transient`
+- `check_bass_mono_compatibility`
+- `set_drum_bus_punch_mode`
+- `score_vocal_intelligibility`
+- `plan_scene_energy_curve`
+- `restore_live_emergency_state`
+- `manage_adaptive_sidechain`
+- `detect_automation_conflicts`
+- `set_device_parameter_lock_mode`
+- `ear_training_prompt_mode`
+- `monitor_session_drift`
+- `run_variant_consistency_audit`
+- `simulate_mix_translation`
+- `batch_song_operations`
+- `package_client_revision`
+- `create_auto_rollback_policy`
+- `run_gain_staging_autopilot`
+- `run_phase_alignment_check`
+- `run_masking_analysis`
+- `manage_dynamic_range`
+- `detect_sibilance_harshness`
+- `run_low_end_control_suite`
+- `optimize_bus_compression`
+- `run_transient_shaping_assistant`
+- `run_stereo_image_optimizer`
+- `manage_reverb_delay_space`
+- `run_automation_quality_check`
+- `run_reference_match_engine`
+- `run_master_chain_safety_scan`
+- `run_mix_translation_diagnostics`
+- `run_stem_quality_auditor`
+- `optimize_clip_gain`
+- `run_noise_floor_check`
+- `run_loudness_workflow_assistant`
+- `analyze_revision_delta`
+- `run_engineering_checklist_mode`
+- `plan_integrated_loudness_meter_path`
+- `configure_true_peak_guardrails`
+- `analyze_spectral_balance_fingerprint`
+- `build_masking_map_v2`
+- `enable_solo_safe_diagnostic_mode`
+- `monitor_correlation_mono_sum`
+- `plan_multiband_dynamics_chain`
+- `generate_de_essing_automation_plan`
+- `plan_vocal_rider`
+- `suggest_parallel_processing_recipes`
+- `manage_send_reverb_economy`
+- `align_delay_coherence`
+- `run_kick_bass_phase_lab`
+- `build_drum_phase_alignment_pack`
+- `apply_translation_presets`
+- `build_headphone_translation_profile`
+- `lock_master_chain_delta`
+- `plan_stem_loudness_normalization`
+- `generate_dynamic_range_report`
+- `build_client_revision_ab_pack`
+- `set_engineering_session_mode`
+- `append_change_attribution_log`
+- `run_blind_ab_helper`
+- `plan_vocal_take_ladder`
+- `plan_vocal_punch_in_session`
+- `map_vocal_breath_noise_candidates`
+- `run_vocal_room_tone_headphone_checklist`
+- `run_vocal_comp_workflow_v2`
+- `analyze_vocal_take_consistency`
+- `plan_vocal_tuning_strategy`
+- `plan_vocal_timing_tighten`
+- `setup_vocal_doubles_stack`
+- `plan_singer_plugin_chain`
+- `run_pre_bounce_sibilance_check`
+- `setup_warmup_then_record_scene`
+- `generate_vocal_harmony_midi_scaffold`
+- `setup_backing_vocal_bus`
+- `configure_singer_warmup_metronome`
+- `export_lyric_cue_sheet_from_clips`
+- `run_vocal_ear_training_checklist`
+- `manage_vocal_fx_snapshots`
+- `audit_vocal_monitor_path_safety`
+- `configure_vocal_setlist_scenes`
+- `plan_vocal_delivery_variants`
+- `plan_vocal_stem_export_naming`
+- `plan_vocal_chain_ab_snapshots`
+- `run_low_latency_vocal_tracking_checklist`
+- `plan_duet_harmony_recording_session`
+- `run_vocal_booth_session_start_macro`
+- `plan_vocal_adlib_lane`
+- `plan_vocal_tone_modes_scenes`
+- `plan_choir_stack_builder`
+- `plan_melody_to_midi_capture_workflow`
+- `run_vocal_pitch_vibrato_analysis_placeholder`
+- `run_vocal_breath_detector_v2_placeholder`
+- `run_vocal_range_report_session`
+- `sync_producer_singer_revision_notes`
+- `plan_vocal_pronunciation_diction_guide`
+- `run_vocal_health_fatigue_guard`
+- `suggest_song_key_from_session_midi`
+- `plan_lead_tuned_vs_raw_stem_matrix`
+- `plan_sync_picture_vocal_cues`
 
 Deeper execution notes:
 
@@ -239,6 +361,14 @@ Deeper execution notes:
 - `create_bus_architecture` now performs concrete routing writes using endpoint variants.
 - `run_release_prep_pipeline` now chains measurable guardrail checks with real queued/optional-start deliverables jobs.
 - `run_release_prep_pipeline` now supports guardrail fail-fast policy (`maxWarnings`) with explicit override (`force=true`).
+- `resolve_kick_bass_conflict` now resolves tracks and applies concrete sidechain routing/parameter proxy writes.
+- `run_release_readiness_score` now uses measurable live signals (tempo/play-state/volume outliers/command health).
+- `run_post_export_qa` now checks deliverable consistency (master/streaming/stems presence + duplicate targets).
+- `run_post_export_qa` supports strict matrix validation (`strictMatrix`) with expected variants (`expectedVariants`).
+- Device parameter lock mode now blocks matching writes globally at execution time.
+- Auto rollback policy now creates periodic checkpoints during mutating command flow.
+- Device locks and rollback policy persist across restarts (`.ableton-device-locks.json`, `.ableton-rollback-policy.json`).
+- Auto rollback policy now supports write-intent categories with per-category checkpoint frequency (`categoryEveryN`).
 
 Notes on deeper execution:
 

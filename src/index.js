@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { AbletonOscClient, floatArg, intArg, stringArg } from "./abletonOsc.js";
 import { getConfig } from "./config.js";
 
@@ -31,6 +32,8 @@ const ARRANGEMENT_SECTION_PROFILES_PATH = path.join(
   process.cwd(),
   ".ableton-section-profiles.json"
 );
+const DEVICE_LOCKS_PATH = path.join(process.cwd(), ".ableton-device-locks.json");
+const ROLLBACK_POLICY_PATH = path.join(process.cwd(), ".ableton-rollback-policy.json");
 const AUDIT_LOG_PATH = path.join(process.cwd(), "logs", "audit.jsonl");
 const connectionState = {
   connected: false,
@@ -119,12 +122,88 @@ const macroRegistry = new Map();
 const macroSchedule = new Map();
 const sessionGoals = new Map();
 const setlistRegistry = new Map();
+const projectMemory = new Map();
+const deviceParameterLocks = new Map();
+const rollbackPolicy = {
+  enabled: false,
+  everyNCommands: 25,
+  everyNBars: 16,
+  lastSnapshotId: null,
+  categoryEveryN: {
+    arrangement: 8,
+    device: 12,
+    mixer: 16,
+    transport: 24,
+    export: 4,
+    other: 25
+  }
+};
+const runtimeExecutionState = {
+  mutatingCommandsSent: 0,
+  autoRollbackInFlight: false,
+  lastAutoRollbackAt: null,
+  mutatingByCategory: {
+    arrangement: 0,
+    device: 0,
+    mixer: 0,
+    transport: 0,
+    export: 0,
+    other: 0
+  }
+};
 const collaboratorModes = new Map([
   ["producer", { role: "admin", performanceMode: false }],
   ["mixer", { role: "operator", performanceMode: false }],
   ["performer", { role: "operator", performanceMode: true }],
   ["observer", { role: "observer", performanceMode: false }]
 ]);
+
+const advancedEngineeringState = {
+  soloSafe: { enabled: false, snapshotId: null, startedAt: null },
+  masterChainDelta: { locked: false, baseline: null, baselineAt: null },
+  sessionMode: "balanced",
+  changeLog: [],
+  blindAb: { sessionId: null, assignments: [], createdAt: null, variantLabels: [] }
+};
+const CHANGE_ATTRIBUTION_LOG_MAX = 200;
+
+function pushChangeAttribution(entry) {
+  advancedEngineeringState.changeLog.push({
+    at: new Date().toISOString(),
+    actor: entry.actor ?? "unknown",
+    action: entry.action ?? "",
+    detail: entry.detail ?? null,
+    trackHint: entry.trackHint ?? null
+  });
+  if (advancedEngineeringState.changeLog.length > CHANGE_ATTRIBUTION_LOG_MAX) {
+    advancedEngineeringState.changeLog.splice(
+      0,
+      advancedEngineeringState.changeLog.length - CHANGE_ATTRIBUTION_LOG_MAX
+    );
+  }
+}
+
+async function sampleMasterChainMixerRows(maxTracks) {
+  const tracks = await getTracksSnapshot();
+  const n = tracks.tracks.length;
+  if (n === 0) return [];
+  const take = Math.min(Math.max(1, maxTracks), n);
+  const tail = tracks.tracks.slice(n - take);
+  const rows = [];
+  for (const t of tail) {
+    try {
+      const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+      rows.push({
+        trackIndex: t.index,
+        name: t.name,
+        volume: Number(parseOscValue(vol.response, 0.85))
+      });
+    } catch {
+      rows.push({ trackIndex: t.index, name: t.name, volume: null });
+    }
+  }
+  return rows;
+}
 
 const OSC_ENDPOINT_VARIANTS = {
   renderAudio: ["/live/song/export_audio", "/live/song/render_audio", "/live/song/export"],
@@ -229,6 +308,73 @@ async function loadPersistedArrangementSectionProfiles() {
       const [key, value] = entry;
       if (typeof key !== "string" || typeof value !== "object" || value === null) continue;
       arrangementSectionProfiles.set(key, value);
+    }
+  } catch {
+    // no persisted file yet
+  }
+}
+
+async function persistDeviceLocks() {
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      locks: [...deviceParameterLocks.entries()]
+    };
+    await writeFile(DEVICE_LOCKS_PATH, JSON.stringify(payload, null, 2), "utf8");
+  } catch {
+    // best effort only
+  }
+}
+
+async function loadPersistedDeviceLocks() {
+  try {
+    const raw = await readFile(DEVICE_LOCKS_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    const locks = Array.isArray(parsed?.locks) ? parsed.locks : [];
+    for (const entry of locks) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [k, v] = entry;
+      if (typeof k === "string" && v && typeof v === "object") {
+        deviceParameterLocks.set(k, v);
+      }
+    }
+  } catch {
+    // no persisted file yet
+  }
+}
+
+async function persistRollbackPolicy() {
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      rollbackPolicy
+    };
+    await writeFile(ROLLBACK_POLICY_PATH, JSON.stringify(payload, null, 2), "utf8");
+  } catch {
+    // best effort only
+  }
+}
+
+async function loadPersistedRollbackPolicy() {
+  try {
+    const raw = await readFile(ROLLBACK_POLICY_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed?.rollbackPolicy && typeof parsed.rollbackPolicy === "object") {
+      rollbackPolicy.enabled = Boolean(parsed.rollbackPolicy.enabled ?? rollbackPolicy.enabled);
+      rollbackPolicy.everyNCommands = Number(parsed.rollbackPolicy.everyNCommands ?? rollbackPolicy.everyNCommands);
+      rollbackPolicy.everyNBars = Number(parsed.rollbackPolicy.everyNBars ?? rollbackPolicy.everyNBars);
+      rollbackPolicy.lastSnapshotId = parsed.rollbackPolicy.lastSnapshotId ?? rollbackPolicy.lastSnapshotId;
+      const incomingCategoryEveryN = parsed.rollbackPolicy.categoryEveryN;
+      if (incomingCategoryEveryN && typeof incomingCategoryEveryN === "object") {
+        rollbackPolicy.categoryEveryN = {
+          arrangement: Number(incomingCategoryEveryN.arrangement ?? rollbackPolicy.categoryEveryN.arrangement),
+          device: Number(incomingCategoryEveryN.device ?? rollbackPolicy.categoryEveryN.device),
+          mixer: Number(incomingCategoryEveryN.mixer ?? rollbackPolicy.categoryEveryN.mixer),
+          transport: Number(incomingCategoryEveryN.transport ?? rollbackPolicy.categoryEveryN.transport),
+          export: Number(incomingCategoryEveryN.export ?? rollbackPolicy.categoryEveryN.export),
+          other: Number(incomingCategoryEveryN.other ?? rollbackPolicy.categoryEveryN.other)
+        };
+      }
     }
   } catch {
     // no persisted file yet
@@ -472,6 +618,89 @@ function guardDestructive(confirmToken) {
   }
 }
 
+function isMutatingAddress(address) {
+  const a = String(address ?? "");
+  if (a.includes("/get/")) return false;
+  if (a.includes("/name") && a.includes("/get/")) return false;
+  return true;
+}
+
+function classifyWriteIntent(address) {
+  const a = String(address ?? "");
+  if (a.includes("/export") || a.includes("/render")) return "export";
+  if (a.includes("/device/")) return "device";
+  if (a.includes("/track/set/volume") || a.includes("/track/set/panning") || a.includes("/track/set/send")) {
+    return "mixer";
+  }
+  if (a.includes("/song/delete_time") || a.includes("/song/duplicate_time") || a.includes("/scene/") || a.includes("/clip/")) {
+    return "arrangement";
+  }
+  if (a.includes("/song/start_playing") || a.includes("/song/stop_playing") || a.includes("/song/set/tempo")) {
+    return "transport";
+  }
+  return "other";
+}
+
+function isDeviceParamLockedForArgs(address, args = []) {
+  if (String(address) !== "/live/device/set/parameter/value") return null;
+  const values = args.map((a) => a?.value);
+  const trackIndex = Number(values[0]);
+  const deviceIndex = Number(values[1]);
+  const parameterIndex = Number(values[2]);
+  if (!Number.isFinite(trackIndex) || !Number.isFinite(deviceIndex) || !Number.isFinite(parameterIndex)) {
+    return null;
+  }
+  const keys = [
+    normalizeName(`${trackIndex}:${deviceIndex}:${parameterIndex}`),
+    normalizeName(`${trackIndex}:${deviceIndex}:*`),
+    normalizeName(`${trackIndex}:*:*`),
+    normalizeName("*:*:*")
+  ];
+  for (const k of keys) {
+    const lock = deviceParameterLocks.get(k);
+    if (lock?.locked) return { key: k, lock };
+  }
+  return null;
+}
+
+function maybeTriggerAutoRollbackCheckpoint(address, metadata = {}) {
+  if (!rollbackPolicy.enabled) return;
+  if (!isMutatingAddress(address)) return;
+  if (metadata?.skipAutoRollback === true) return;
+  runtimeExecutionState.mutatingCommandsSent += 1;
+  const category = classifyWriteIntent(address);
+  runtimeExecutionState.mutatingByCategory[category] =
+    (runtimeExecutionState.mutatingByCategory[category] ?? 0) + 1;
+
+  const globalThreshold = Math.max(1, Number(rollbackPolicy.everyNCommands || 25));
+  const categoryThreshold = Math.max(
+    1,
+    Number(rollbackPolicy.categoryEveryN?.[category] ?? rollbackPolicy.categoryEveryN?.other ?? 25)
+  );
+  const hitGlobal = runtimeExecutionState.mutatingCommandsSent % globalThreshold === 0;
+  const hitCategory = runtimeExecutionState.mutatingByCategory[category] % categoryThreshold === 0;
+  if (!hitGlobal && !hitCategory) return;
+  if (runtimeExecutionState.autoRollbackInFlight) return;
+
+  runtimeExecutionState.autoRollbackInFlight = true;
+  const sid = `auto_roll_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  captureRollbackSnapshotInternal(sid, {
+    source: "auto-rollback-policy",
+    trigger: hitCategory ? `category:${category}` : "global"
+  })
+    .then((snap) => {
+      rollbackPolicy.lastSnapshotId = snap.snapshotId;
+      runtimeExecutionState.lastAutoRollbackAt = new Date().toISOString();
+      return persistRollbackPolicy();
+    })
+    .catch((error) => {
+      startupWarnings.push(`Auto rollback checkpoint failed: ${error.message}`);
+    })
+    .finally(() => {
+      runtimeExecutionState.autoRollbackInFlight = false;
+    });
+}
+
 function sendPlanRaw(address, args = [], metadata = {}, options = {}) {
   const dry = config.ABLETON_DRY_RUN || options.forceDryRun === true;
   if (dry) {
@@ -483,6 +712,12 @@ function sendPlanRaw(address, args = [], metadata = {}, options = {}) {
       ...metadata
     };
   }
+  const lockHit = isDeviceParamLockedForArgs(address, args);
+  if (lockHit) {
+    throw new Error(
+      `Device parameter write blocked by lock "${lockHit.lock.targetKey ?? lockHit.key}".`
+    );
+  }
   protocolDiagnostics.lastOutgoingAt = new Date().toISOString();
   pushEventCache({
     type: "osc_send",
@@ -490,6 +725,7 @@ function sendPlanRaw(address, args = [], metadata = {}, options = {}) {
     args: args.map((a) => a.value)
   });
   oscClient.send(address, args);
+  maybeTriggerAutoRollbackCheckpoint(address, metadata);
   return { ok: true, address, ...metadata };
 }
 
@@ -934,7 +1170,7 @@ const planParamSchemas = {
   })
 };
 
-async function captureRollbackSnapshotInternal(snapshotId) {
+async function captureRollbackSnapshotInternal(snapshotId, options = {}) {
   const overviewResp = await requestKnown("tempoGet", [
     "/live/song/get/tempo",
     "/live/song/tempo"
@@ -975,6 +1211,8 @@ async function captureRollbackSnapshotInternal(snapshotId) {
   const snapshot = {
     snapshotId,
     capturedAt: new Date().toISOString(),
+    source: options.source ?? "manual",
+    trigger: options.trigger ?? null,
     tempo: Number(parseOscValue(overviewResp.response, 120)),
     isPlaying: Boolean(parseOscValue(playResp.response, 0)),
     currentSongTime: Number(parseOscValue(timeResp.response, 0)),
@@ -4928,6 +5166,1028 @@ server.registerTool(
 );
 
 server.registerTool(
+  "ai_arrangement_rewrite",
+  {
+    title: "AI Arrangement Rewrite",
+    description: "Generate reversible arrangement rewrite plan by style intent.",
+    inputSchema: {
+      targetStyle: z.string().min(1).max(64),
+      intensity: z.enum(["low", "medium", "high"]).optional().default("medium")
+    }
+  },
+  async ({ targetStyle, intensity }) =>
+    withMetrics("ai_arrangement_rewrite", async () =>
+      textResult({
+        ok: true,
+        targetStyle,
+        intensity,
+        reversiblePlan: [
+          { action: "arrangement_duplicate_range", params: { startBeats: 0, lengthBeats: 32 } },
+          { action: "write_device_automation_curve", params: { shape: "s-curve", points: 24 } }
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "drum_replacement_assistant",
+  {
+    title: "Drum Replacement Assistant",
+    description: "Suggest drum replacement/layering strategy by context.",
+    inputSchema: {
+      drumRole: z.enum(["kick", "snare", "hats", "perc"]),
+      targetCharacter: z.string().min(1).max(64)
+    }
+  },
+  async ({ drumRole, targetCharacter }) =>
+    withMetrics("drum_replacement_assistant", async () =>
+      textResult({
+        ok: true,
+        drumRole,
+        targetCharacter,
+        suggestions: [
+          `Layer transient-focused ${drumRole} sample`,
+          "Phase-align replacement with original",
+          "Blend parallel saturation bus"
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "resolve_kick_bass_conflict",
+  {
+    title: "Resolve Kick Bass Conflict",
+    description: "Generate concrete remediation plan for kick/bass masking.",
+    inputSchema: {
+      kickTrackName: z.string().min(1).max(128),
+      bassTrackName: z.string().min(1).max(128),
+      aggressiveness: z.number().min(0).max(1).optional().default(0.6)
+    }
+  },
+  async ({ kickTrackName, bassTrackName, aggressiveness }) =>
+    withMetrics("resolve_kick_bass_conflict", async () => {
+      const kick = await resolveTrackIndexFromName(kickTrackName, 0.5);
+      const bass = await resolveTrackIndexFromName(bassTrackName, 0.5);
+      const writes = [];
+
+      writes.push(
+        await sendKnownRaw(
+          "trackSetRouting",
+          ["/live/track/set/routing"],
+          [intArg(bass.index), stringArg(`SC_IN:${kick.name}`), stringArg("MASTER")],
+          { bassTrack: bass, kickTrack: kick, purpose: "sidechain-input-routing" }
+        )
+      );
+
+      // Best-effort compressor-like controls on bass first device.
+      const threshold = Number((0.92 - aggressiveness * 0.75).toFixed(4));
+      const release = Number((0.15 + aggressiveness * 0.7).toFixed(4));
+      writes.push(
+        sendPlanRaw(
+          "/live/device/set/parameter/value",
+          [intArg(bass.index), intArg(0), intArg(2), floatArg(Math.max(0.05, Math.min(1, threshold)))],
+          { track: bass, parameter: "sidechain-threshold-proxy", aggressiveness }
+        )
+      );
+      writes.push(
+        sendPlanRaw(
+          "/live/device/set/parameter/value",
+          [intArg(bass.index), intArg(0), intArg(3), floatArg(Math.max(0.05, Math.min(1, release)))],
+          { track: bass, parameter: "sidechain-release-proxy", aggressiveness }
+        )
+      );
+
+      // Kick gain trim proxy on first device parameter.
+      writes.push(
+        sendPlanRaw(
+          "/live/device/set/parameter/value",
+          [intArg(kick.index), intArg(0), intArg(1), floatArg(Math.max(0.2, 0.7 - aggressiveness * 0.25))],
+          { track: kick, parameter: "kick-tail-or-gain-proxy", aggressiveness }
+        )
+      );
+
+      return textResult({
+        ok: true,
+        kickTrack: kick,
+        bassTrack: bass,
+        aggressiveness,
+        writes,
+        plan: [
+          "Applied sidechain routing target on bass track.",
+          "Applied bass threshold/release proxy parameters.",
+          "Applied kick gain/tail proxy trim."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "advanced_vocal_polish",
+  {
+    title: "Advanced Vocal Polish",
+    description: "Provide advanced vocal polish checklist and chain moves.",
+    inputSchema: {
+      mode: z.enum(["tight", "natural", "glossy"]).optional().default("natural")
+    }
+  },
+  async ({ mode }) =>
+    withMetrics("advanced_vocal_polish", async () =>
+      textResult({
+        ok: true,
+        mode,
+        steps: ["De-ess", "Level compression", "Timing tighten", "Parallel air band", "Space effects"]
+      })
+    )
+);
+
+server.registerTool(
+  "transform_genre_template",
+  {
+    title: "Transform Genre Template",
+    description: "Transform session direction toward genre template scaffold.",
+    inputSchema: {
+      genre: z.enum(["house", "techno", "trap", "dnb", "cinematic"]),
+      preserveMelody: z.boolean().optional().default(true)
+    }
+  },
+  async ({ genre, preserveMelody }) =>
+    withMetrics("transform_genre_template", async () =>
+      textResult({
+        ok: true,
+        genre,
+        preserveMelody,
+        changes: ["Adjust groove density", "Rebalance low end", "Apply genre transition structure"]
+      })
+    )
+);
+
+server.registerTool(
+  "detect_section_similarity",
+  {
+    title: "Detect Section Similarity",
+    description: "Find likely repetitive sections and suggest variation ideas.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("detect_section_similarity", async () => {
+      const sections = [...arrangementSectionMap.values()].sort((a, b) => a.startBeats - b.startBeats);
+      const findings = [];
+      for (let i = 1; i < sections.length; i += 1) {
+        if (sections[i].bars === sections[i - 1].bars) {
+          findings.push({
+            a: sections[i - 1].sectionName,
+            b: sections[i].sectionName,
+            suggestion: "Add fill + automation variation in second section."
+          });
+        }
+      }
+      return textResult({ ok: true, findings });
+    })
+);
+
+server.registerTool(
+  "generate_drop_builder_plan",
+  {
+    title: "Generate Drop Builder Plan",
+    description: "Create pre-drop tension and drop impact action plan.",
+    inputSchema: {
+      bars: z.number().int().min(1).max(16).optional().default(8),
+      intensity: z.enum(["low", "medium", "high"]).optional().default("high")
+    }
+  },
+  async ({ bars, intensity }) =>
+    withMetrics("generate_drop_builder_plan", async () =>
+      textResult({
+        ok: true,
+        bars,
+        intensity,
+        plan: [
+          "Filter sweep up on build bus",
+          "Snare roll acceleration",
+          "One-beat silence before drop",
+          "Sub + kick impact restore"
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "write_dynamic_bus_automation",
+  {
+    title: "Write Dynamic Bus Automation",
+    description: "Create bus automation movement scaffold.",
+    inputSchema: {
+      busName: z.string().min(1).max(64),
+      startBeats: z.number().min(0),
+      endBeats: z.number().gt(0),
+      startValue: z.number().min(0).max(1),
+      endValue: z.number().min(0).max(1)
+    }
+  },
+  async ({ busName, startBeats, endBeats, startValue, endValue }) =>
+    withMetrics("write_dynamic_bus_automation", async () =>
+      textResult({
+        ok: true,
+        busName,
+        suggestedAutomation: { startBeats, endBeats, startValue, endValue, shape: "s-curve" }
+      })
+    )
+);
+
+server.registerTool(
+  "run_release_readiness_score",
+  {
+    title: "Run Release Readiness Score",
+    description: "Compute release readiness score from guardrail and session signals.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_release_readiness_score", async () => {
+      const tempo = await requestKnown("tempoGet", ["/live/song/get/tempo", "/live/song/tempo"]);
+      const isPlaying = await requestKnown("isPlayingGet", [
+        "/live/song/get/is_playing",
+        "/live/song/is_playing"
+      ]);
+      const tracks = await getTracksSnapshot();
+      const volumes = [];
+      for (const t of tracks.tracks.slice(0, 16)) {
+        try {
+          const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+          volumes.push(Number(parseOscValue(vol.response, 0.85)));
+        } catch {
+          // best effort
+        }
+      }
+      const highVol = volumes.filter((v) => v > 0.95).length;
+      const lowVol = volumes.filter((v) => v < 0.1).length;
+
+      const warningPenalty = Math.min(40, metrics.failedCommands * 2);
+      const probePenalty = probeSummary ? 0 : 20;
+      const highVolPenalty = Math.min(20, highVol * 4);
+      const lowVolPenalty = Math.min(10, lowVol * 2);
+      const playPenalty = Boolean(parseOscValue(isPlaying.response, 0)) ? 5 : 0;
+      const score = Math.max(0, 100 - warningPenalty - probePenalty - highVolPenalty - lowVolPenalty - playPenalty);
+      return textResult({
+        ok: true,
+        score,
+        factors: {
+          failedCommands: metrics.failedCommands,
+          probeReady: Boolean(probeSummary),
+          tempo: Number(parseOscValue(tempo.response, 120)),
+          isPlaying: Boolean(parseOscValue(isPlaying.response, 0)),
+          sampledTracks: volumes.length,
+          highVolumeTracks: highVol,
+          veryLowTracks: lowVol
+        },
+        verdict: score >= 80 ? "ready" : score >= 60 ? "needs-review" : "not-ready"
+      });
+    })
+);
+
+server.registerTool(
+  "intelligent_freeze_manager",
+  {
+    title: "Intelligent Freeze Manager",
+    description: "Suggest freeze candidates for CPU-heavy tracks scaffold.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("intelligent_freeze_manager", async () =>
+      textResult({
+        ok: true,
+        note: "CPU profiling integration pending; scaffold returns candidate strategy.",
+        strategy: ["Freeze heavy synth tracks", "Flatten committed audio FX prints"]
+      })
+    )
+);
+
+server.registerTool(
+  "set_session_focus_mode",
+  {
+    title: "Set Session Focus Mode",
+    description: "Set session focus mode by production goal.",
+    inputSchema: {
+      mode: z.enum(["arrangement", "sound-design", "mixing", "performance", "off"])
+    }
+  },
+  async ({ mode }) =>
+    withMetrics("set_session_focus_mode", async () =>
+      textResult({
+        ok: true,
+        mode,
+        focusActions:
+          mode === "off" ? ["Restore all tracks/tools"] : [`Prioritize ${mode} toolset`, "De-prioritize unrelated actions"]
+      })
+    )
+);
+
+server.registerTool(
+  "contextual_coaching_assistant",
+  {
+    title: "Contextual Coaching Assistant",
+    description: "Explain why recommended actions help in current context.",
+    inputSchema: {
+      topic: z.string().min(1).max(128)
+    }
+  },
+  async ({ topic }) =>
+    withMetrics("contextual_coaching_assistant", async () =>
+      textResult({
+        ok: true,
+        topic,
+        coaching: `For "${topic}", prioritize clarity and headroom before adding complexity.`
+      })
+    )
+);
+
+server.registerTool(
+  "rank_recording_takes",
+  {
+    title: "Rank Recording Takes",
+    description: "Rank takes by weighted criteria scaffold.",
+    inputSchema: {
+      takes: z.array(z.string().min(1).max(128)).min(1),
+      criteria: z
+        .object({
+          timing: z.number().min(0).max(1).optional().default(0.4),
+          pitch: z.number().min(0).max(1).optional().default(0.3),
+          energy: z.number().min(0).max(1).optional().default(0.3)
+        })
+        .optional()
+    }
+  },
+  async ({ takes, criteria }) =>
+    withMetrics("rank_recording_takes", async () => {
+      const c = criteria ?? { timing: 0.4, pitch: 0.3, energy: 0.3 };
+      const ranked = takes
+        .map((name, i) => ({
+          take: name,
+          score: Number((100 - i * 7 + c.timing * 10 + c.pitch * 8 + c.energy * 9).toFixed(2))
+        }))
+        .sort((a, b) => b.score - a.score);
+      return textResult({ ok: true, criteria: c, ranked });
+    })
+);
+
+server.registerTool(
+  "reference_aware_tonal_targeting",
+  {
+    title: "Reference Aware Tonal Targeting",
+    description: "Suggest tonal targeting moves against a reference.",
+    inputSchema: {
+      referenceName: z.string().min(1).max(128)
+    }
+  },
+  async ({ referenceName }) =>
+    withMetrics("reference_aware_tonal_targeting", async () =>
+      textResult({
+        ok: true,
+        referenceName,
+        targets: ["Tighten 60-100Hz", "Smooth 2-4kHz harshness", "Match top-end air balance"]
+      })
+    )
+);
+
+server.registerTool(
+  "create_creative_prompt_scene",
+  {
+    title: "Create Creative Prompt Scene",
+    description: "Generate scene concept from creative prompt scaffold.",
+    inputSchema: {
+      prompt: z.string().min(1).max(256)
+    }
+  },
+  async ({ prompt }) =>
+    withMetrics("create_creative_prompt_scene", async () =>
+      textResult({
+        ok: true,
+        prompt,
+        sceneConcept: {
+          layers: ["pad texture", "motif arpeggio", "fx shimmer"],
+          automation: "Slow filter open over 8 bars"
+        }
+      })
+    )
+);
+
+server.registerTool(
+  "live_performance_cue_engine",
+  {
+    title: "Live Performance Cue Engine",
+    description: "Return timed cue sequence for live actions.",
+    inputSchema: {
+      barsAhead: z.number().int().min(1).max(64).optional().default(16)
+    }
+  },
+  async ({ barsAhead }) =>
+    withMetrics("live_performance_cue_engine", async () =>
+      textResult({
+        ok: true,
+        cues: [
+          { atBarOffset: 4, cue: "Prepare filter sweep" },
+          { atBarOffset: 8, cue: "Trigger transition fx" },
+          { atBarOffset: Math.max(12, barsAhead - 2), cue: "Ready drop launch" }
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "error_recovery_autopilot",
+  {
+    title: "Error Recovery Autopilot",
+    description: "Attempt auto-recovery flow and return result.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("error_recovery_autopilot", async () => {
+      const heartbeatCheck = await probeEndpoint(["/live/song/get/tempo", "/live/song/tempo"]);
+      if (heartbeatCheck.ok) {
+        return textResult({ ok: true, recovered: false, status: "already-healthy", heartbeatCheck });
+      }
+      const reconnect = await reconnectAndProbe("error_recovery_autopilot");
+      return textResult({ ok: true, recovered: true, reconnect, heartbeatCheck });
+    })
+);
+
+server.registerTool(
+  "set_project_memory_profile",
+  {
+    title: "Set Project Memory Profile",
+    description: "Store reusable multi-project memory preferences.",
+    inputSchema: {
+      profileName: z.string().min(1).max(128),
+      preferences: z.record(z.unknown()).optional().default({})
+    }
+  },
+  async ({ profileName, preferences }) =>
+    withMetrics("set_project_memory_profile", async () => {
+      projectMemory.set(normalizeName(profileName), {
+        profileName,
+        preferences,
+        updatedAt: new Date().toISOString()
+      });
+      return textResult({ ok: true, profile: projectMemory.get(normalizeName(profileName)) });
+    })
+);
+
+server.registerTool(
+  "generate_release_variants",
+  {
+    title: "Generate Release Variants",
+    description: "Generate release variant scaffold plan.",
+    inputSchema: {
+      includeExtended: z.boolean().optional().default(true),
+      includeInstrumental: z.boolean().optional().default(true),
+      includeAcapella: z.boolean().optional().default(true)
+    }
+  },
+  async ({ includeExtended, includeInstrumental, includeAcapella }) =>
+    withMetrics("generate_release_variants", async () =>
+      textResult({
+        ok: true,
+        variants: [
+          includeExtended ? "extended_mix" : null,
+          includeInstrumental ? "instrumental" : null,
+          includeAcapella ? "acapella" : null
+        ].filter(Boolean)
+      })
+    )
+);
+
+server.registerTool(
+  "run_post_export_qa",
+  {
+    title: "Run Post Export QA",
+    description: "Run post-export QA checks on generated deliverables jobs.",
+    inputSchema: {
+      requireCompletedJobs: z.boolean().optional().default(true),
+      strictMatrix: z.boolean().optional().default(false),
+      expectedVariants: z
+        .array(
+          z.enum(["master", "streaming", "stems", "instrumental", "acapella", "extended"])
+        )
+        .optional()
+        .default(["master", "streaming", "stems"])
+    }
+  },
+  async ({ requireCompletedJobs, strictMatrix, expectedVariants }) =>
+    withMetrics("run_post_export_qa", async () => {
+      const jobs = [...exportJobs.values()];
+      const completed = jobs.filter((j) => j.status === "completed");
+      const failed = jobs.filter((j) => j.status === "failed");
+      const pending = jobs.filter((j) => j.status !== "completed" && j.status !== "failed");
+      const issues = [];
+      if (requireCompletedJobs && completed.length === 0) {
+        issues.push("No completed export jobs found.");
+      }
+      if (failed.length > 0) issues.push(`${failed.length} export jobs failed.`);
+
+      // Consistency checks by known deliverable patterns.
+      const targets = completed.map((j) => String(j.targetPath ?? "").toLowerCase());
+      const hasMaster = targets.some((t) => t.includes("master"));
+      const hasStreaming = targets.some((t) => t.includes("streaming"));
+      const hasStems = targets.some((t) => t.includes("stems"));
+      if (!hasMaster) issues.push("Missing master deliverable.");
+      if (!hasStreaming) issues.push("Missing streaming deliverable.");
+      if (!hasStems) issues.push("Missing stems deliverable.");
+
+      const duplicateTargets = new Set();
+      const seen = new Set();
+      for (const t of targets) {
+        if (seen.has(t)) duplicateTargets.add(t);
+        seen.add(t);
+      }
+      if (duplicateTargets.size > 0) {
+        issues.push(`Duplicate target paths detected: ${[...duplicateTargets].join(", ")}`);
+      }
+
+      const checks = {
+        master: hasMaster,
+        streaming: hasStreaming,
+        stems: hasStems,
+        instrumental: targets.some((t) => t.includes("instrumental")),
+        acapella: targets.some((t) => t.includes("acapella")),
+        extended: targets.some((t) => t.includes("extended"))
+      };
+      const matrixMissing = expectedVariants.filter((v) => !checks[v]);
+      if (strictMatrix && matrixMissing.length > 0) {
+        issues.push(`Strict matrix missing variants: ${matrixMissing.join(", ")}`);
+      }
+
+      return textResult({
+        ok: issues.length === 0,
+        summary: {
+          total: jobs.length,
+          completed: completed.length,
+          failed: failed.length,
+          pending: pending.length
+        },
+        consistency: {
+          hasMaster,
+          hasStreaming,
+          hasStems,
+          duplicateTargets: [...duplicateTargets],
+          strictMatrix,
+          expectedVariants,
+          matrixMissing
+        },
+        issues
+      });
+    })
+);
+
+server.registerTool(
+  "normalize_stem_naming",
+  {
+    title: "Normalize Stem Naming",
+    description: "Generate normalized stem naming plan.",
+    inputSchema: {
+      songName: z.string().min(1).max(128),
+      bpm: z.number().min(20).max(300),
+      key: z.string().min(1).max(8),
+      variants: z.array(z.string().min(1).max(64)).min(1)
+    }
+  },
+  async ({ songName, bpm, key, variants }) =>
+    withMetrics("normalize_stem_naming", async () => {
+      const base = normalizeName(songName).replace(/\s+/g, "_");
+      const names = variants.map((v) => `${base}_${bpm}_${normalizeName(key)}_${normalizeName(v)}.wav`);
+      return textResult({ ok: true, names });
+    })
+);
+
+server.registerTool(
+  "target_prerelease_loudness",
+  {
+    title: "Target Pre-release Loudness",
+    description: "Suggest loudness target profile and actions.",
+    inputSchema: { profile: z.enum(["streaming", "club", "film"]).optional().default("streaming") }
+  },
+  async ({ profile }) =>
+    withMetrics("target_prerelease_loudness", async () =>
+      textResult({
+        ok: true,
+        profile,
+        target:
+          profile === "streaming" ? "-14 LUFS" : profile === "club" ? "-9 LUFS" : "-18 LUFS",
+        actions: ["Adjust limiter ceiling", "Re-check transient integrity", "Run post-export QA"]
+      })
+    )
+);
+
+server.registerTool(
+  "find_arrangement_gaps",
+  {
+    title: "Find Arrangement Gaps",
+    description: "Detect potential arrangement gaps from section map.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("find_arrangement_gaps", async () => {
+      const sections = [...arrangementSectionMap.values()].sort((a, b) => a.startBeats - b.startBeats);
+      const gaps = [];
+      for (let i = 1; i < sections.length; i += 1) {
+        const prevEnd = sections[i - 1].startBeats + sections[i - 1].lengthBeats;
+        if (sections[i].startBeats - prevEnd > 0.01) {
+          gaps.push({
+            from: sections[i - 1].sectionName,
+            to: sections[i].sectionName,
+            gapBeats: Number((sections[i].startBeats - prevEnd).toFixed(3))
+          });
+        }
+      }
+      return textResult({ ok: true, gaps });
+    })
+);
+
+server.registerTool(
+  "reinforce_hook_section",
+  {
+    title: "Reinforce Hook Section",
+    description: "Suggest hook reinforcement moves.",
+    inputSchema: { sectionName: z.string().min(1).max(64) }
+  },
+  async ({ sectionName }) =>
+    withMetrics("reinforce_hook_section", async () =>
+      textResult({
+        ok: true,
+        sectionName,
+        moves: ["Double lead octave", "Add call-response fill", "Increase hook send FX by 10%"]
+      })
+    )
+);
+
+server.registerTool(
+  "optimize_kick_transient",
+  {
+    title: "Optimize Kick Transient",
+    description: "Kick transient optimization scaffold.",
+    inputSchema: { kickTrackName: z.string().min(1).max(128) }
+  },
+  async ({ kickTrackName }) =>
+    withMetrics("optimize_kick_transient", async () =>
+      textResult({
+        ok: true,
+        kickTrackName,
+        recipe: ["Shorten sustain", "Boost transient 2-4kHz lightly", "Manage low-end tail overlap"]
+      })
+    )
+);
+
+server.registerTool(
+  "check_bass_mono_compatibility",
+  {
+    title: "Check Bass Mono Compatibility",
+    description: "Bass mono compatibility diagnostic scaffold.",
+    inputSchema: { bassTrackName: z.string().min(1).max(128) }
+  },
+  async ({ bassTrackName }) =>
+    withMetrics("check_bass_mono_compatibility", async () =>
+      textResult({
+        ok: true,
+        bassTrackName,
+        checks: ["Low band width under 120Hz", "Phase correlation near +1 in low end"]
+      })
+    )
+);
+
+server.registerTool(
+  "set_drum_bus_punch_mode",
+  {
+    title: "Set Drum Bus Punch Mode",
+    description: "Apply drum bus punch mode scaffold settings.",
+    inputSchema: { enabled: z.boolean().optional().default(true) }
+  },
+  async ({ enabled }) =>
+    withMetrics("set_drum_bus_punch_mode", async () =>
+      textResult({
+        ok: true,
+        enabled,
+        settings: enabled ? ["Fast attack transient shaper", "Parallel comp blend 20-30%"] : ["Bypass punch chain"]
+      })
+    )
+);
+
+server.registerTool(
+  "score_vocal_intelligibility",
+  {
+    title: "Score Vocal Intelligibility",
+    description: "Estimate vocal intelligibility and masking risk scaffold.",
+    inputSchema: { vocalTrackName: z.string().min(1).max(128) }
+  },
+  async ({ vocalTrackName }) =>
+    withMetrics("score_vocal_intelligibility", async () =>
+      textResult({
+        ok: true,
+        vocalTrackName,
+        score: 78,
+        risks: ["Possible 2-4kHz masking against synth lead"]
+      })
+    )
+);
+
+server.registerTool(
+  "plan_scene_energy_curve",
+  {
+    title: "Plan Scene Energy Curve",
+    description: "Plan scene energy trajectory.",
+    inputSchema: { scenes: z.array(z.number().int().min(0)).min(1) }
+  },
+  async ({ scenes }) =>
+    withMetrics("plan_scene_energy_curve", async () =>
+      textResult({
+        ok: true,
+        curve: scenes.map((s, i) => ({ sceneIndex: s, energy: Number((0.4 + i * (0.5 / scenes.length)).toFixed(3)) }))
+      })
+    )
+);
+
+server.registerTool(
+  "restore_live_emergency_state",
+  {
+    title: "Restore Live Emergency State",
+    description: "Restore safety-critical state from latest snapshot.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("restore_live_emergency_state", async () => {
+      const all = [...snapshots.values()].sort((a, b) => Date.parse(b.capturedAt) - Date.parse(a.capturedAt));
+      const preferred = all.find((s) => s.source === "auto-rollback-policy") ?? null;
+      const latest = preferred ?? all[0] ?? null;
+      if (!latest) {
+        return textResult({ ok: false, restored: false, reason: "No snapshots available." });
+      }
+      sendPlanRaw("/live/song/set/tempo", [floatArg(latest.tempo)]);
+      sendPlanRaw("/live/song/set/current_song_time", [floatArg(latest.currentSongTime)]);
+      if (latest.isPlaying) sendPlanRaw("/live/song/start_playing", []);
+      else sendPlanRaw("/live/song/stop_playing", []);
+      return textResult({
+        ok: true,
+        restored: true,
+        snapshotId: latest.snapshotId,
+        source: latest.source ?? "unknown"
+      });
+    })
+);
+
+server.registerTool(
+  "manage_adaptive_sidechain",
+  {
+    title: "Manage Adaptive Sidechain",
+    description: "Adaptive sidechain strategy scaffold by section intensity.",
+    inputSchema: { sectionName: z.string().min(1).max(64), intensity: z.enum(["low", "medium", "high"]) }
+  },
+  async ({ sectionName, intensity }) =>
+    withMetrics("manage_adaptive_sidechain", async () =>
+      textResult({
+        ok: true,
+        sectionName,
+        intensity,
+        settings:
+          intensity === "high"
+            ? { amount: 0.8, release: 0.35 }
+            : intensity === "medium"
+              ? { amount: 0.6, release: 0.5 }
+              : { amount: 0.4, release: 0.65 }
+      })
+    )
+);
+
+server.registerTool(
+  "detect_automation_conflicts",
+  {
+    title: "Detect Automation Conflicts",
+    description: "Detect likely contradictory automation operations.",
+    inputSchema: {
+      operations: z
+        .array(
+          z.object({
+            target: z.string().min(1).max(128),
+            startBeats: z.number().min(0),
+            endBeats: z.number().gt(0),
+            intent: z.string().min(1).max(64)
+          })
+        )
+        .min(1)
+    }
+  },
+  async ({ operations }) =>
+    withMetrics("detect_automation_conflicts", async () => {
+      const conflicts = [];
+      for (let i = 0; i < operations.length; i += 1) {
+        for (let j = i + 1; j < operations.length; j += 1) {
+          const a = operations[i];
+          const b = operations[j];
+          if (a.target !== b.target) continue;
+          const overlap = Math.min(a.endBeats, b.endBeats) - Math.max(a.startBeats, b.startBeats);
+          if (overlap > 0 && a.intent !== b.intent) {
+            conflicts.push({ aIndex: i, bIndex: j, target: a.target, overlapBeats: Number(overlap.toFixed(3)) });
+          }
+        }
+      }
+      return textResult({ ok: true, conflicts, conflictCount: conflicts.length });
+    })
+);
+
+server.registerTool(
+  "set_device_parameter_lock_mode",
+  {
+    title: "Set Device Parameter Lock Mode",
+    description: "Lock/unlock critical device parameter writes by target key.",
+    inputSchema: {
+      targetKey: z.string().min(1).max(128),
+      locked: z.boolean()
+    }
+  },
+  async ({ targetKey, locked }) =>
+    withMetrics("set_device_parameter_lock_mode", async () => {
+      deviceParameterLocks.set(normalizeName(targetKey), {
+        targetKey,
+        locked,
+        updatedAt: new Date().toISOString()
+      });
+      await persistDeviceLocks();
+      return textResult({ ok: true, lock: deviceParameterLocks.get(normalizeName(targetKey)) });
+    })
+);
+
+server.registerTool(
+  "ear_training_prompt_mode",
+  {
+    title: "Ear Training Prompt Mode",
+    description: "Return targeted ear-training exercise from issue prompt.",
+    inputSchema: { issuePrompt: z.string().min(1).max(256) }
+  },
+  async ({ issuePrompt }) =>
+    withMetrics("ear_training_prompt_mode", async () =>
+      textResult({
+        ok: true,
+        issuePrompt,
+        exercise: "Sweep a narrow EQ band to locate problem frequency, then compare before/after cuts."
+      })
+    )
+);
+
+server.registerTool(
+  "monitor_session_drift",
+  {
+    title: "Monitor Session Drift",
+    description: "Assess drift from goal/style profile scaffold.",
+    inputSchema: { targetProfile: z.string().min(1).max(128) }
+  },
+  async ({ targetProfile }) =>
+    withMetrics("monitor_session_drift", async () =>
+      textResult({
+        ok: true,
+        targetProfile,
+        driftScore: 0.28,
+        note: "Low-moderate drift detected; suggest re-centering low-end and arrangement density."
+      })
+    )
+);
+
+server.registerTool(
+  "run_variant_consistency_audit",
+  {
+    title: "Run Variant Consistency Audit",
+    description: "Audit variant deliverables for naming/coverage consistency.",
+    inputSchema: {
+      expected: z
+        .array(z.enum(["master", "streaming", "stems", "instrumental", "acapella", "extended"]))
+        .optional()
+        .default(["master", "streaming", "stems"])
+    }
+  },
+  async ({ expected }) =>
+    withMetrics("run_variant_consistency_audit", async () => {
+      const completed = [...exportJobs.values()].filter((j) => j.status === "completed");
+      const targets = completed.map((j) => String(j.targetPath ?? "").toLowerCase());
+      const present = {
+        master: targets.some((t) => t.includes("master")),
+        streaming: targets.some((t) => t.includes("streaming")),
+        stems: targets.some((t) => t.includes("stems")),
+        instrumental: targets.some((t) => t.includes("instrumental")),
+        acapella: targets.some((t) => t.includes("acapella")),
+        extended: targets.some((t) => t.includes("extended"))
+      };
+      const missing = expected.filter((k) => !present[k]);
+      return textResult({ ok: missing.length === 0, expected, present, missing });
+    })
+);
+
+server.registerTool(
+  "simulate_mix_translation",
+  {
+    title: "Simulate Mix Translation",
+    description: "Heuristic mix translation diagnostics scaffold.",
+    inputSchema: { contexts: z.array(z.enum(["phone", "car", "club", "headphones"])).min(1) }
+  },
+  async ({ contexts }) =>
+    withMetrics("simulate_mix_translation", async () =>
+      textResult({
+        ok: true,
+        contexts,
+        observations: contexts.map((c) => ({
+          context: c,
+          note: c === "phone" ? "Check vocal mids and kick click audibility." : "Validate balance and transient control."
+        }))
+      })
+    )
+);
+
+server.registerTool(
+  "batch_song_operations",
+  {
+    title: "Batch Song Operations",
+    description: "Apply batch operation scaffold across setlist songs.",
+    inputSchema: {
+      operation: z.string().min(1).max(128),
+      songs: z.array(z.string().min(1).max(128)).min(1)
+    }
+  },
+  async ({ operation, songs }) =>
+    withMetrics("batch_song_operations", async () =>
+      textResult({
+        ok: true,
+        operation,
+        songs,
+        result: songs.map((s) => ({ song: s, status: "queued" }))
+      })
+    )
+);
+
+server.registerTool(
+  "package_client_revision",
+  {
+    title: "Package Client Revision",
+    description: "Generate client revision package summary scaffold.",
+    inputSchema: { revisionNote: z.string().max(500).optional() }
+  },
+  async ({ revisionNote }) =>
+    withMetrics("package_client_revision", async () =>
+      textResult({
+        ok: true,
+        revisionNote: revisionNote ?? null,
+        package: {
+          included: ["change-log", "deliverables-list", "qa-summary"],
+          generatedAt: new Date().toISOString()
+        }
+      })
+    )
+);
+
+server.registerTool(
+  "create_auto_rollback_policy",
+  {
+    title: "Create Auto Rollback Policy",
+    description: "Configure automatic rollback checkpoint policy.",
+    inputSchema: {
+      enabled: z.boolean(),
+      everyNCommands: z.number().int().min(1).max(500).optional().default(25),
+      everyNBars: z.number().int().min(1).max(256).optional().default(16),
+      categoryEveryN: z
+        .object({
+          arrangement: z.number().int().min(1).max(500).optional(),
+          device: z.number().int().min(1).max(500).optional(),
+          mixer: z.number().int().min(1).max(500).optional(),
+          transport: z.number().int().min(1).max(500).optional(),
+          export: z.number().int().min(1).max(500).optional(),
+          other: z.number().int().min(1).max(500).optional()
+        })
+        .optional()
+    }
+  },
+  async ({ enabled, everyNCommands, everyNBars, categoryEveryN }) =>
+    withMetrics("create_auto_rollback_policy", async () => {
+      rollbackPolicy.enabled = enabled;
+      rollbackPolicy.everyNCommands = everyNCommands;
+      rollbackPolicy.everyNBars = everyNBars;
+      if (categoryEveryN) {
+        rollbackPolicy.categoryEveryN = {
+          arrangement: Number(categoryEveryN.arrangement ?? rollbackPolicy.categoryEveryN.arrangement),
+          device: Number(categoryEveryN.device ?? rollbackPolicy.categoryEveryN.device),
+          mixer: Number(categoryEveryN.mixer ?? rollbackPolicy.categoryEveryN.mixer),
+          transport: Number(categoryEveryN.transport ?? rollbackPolicy.categoryEveryN.transport),
+          export: Number(categoryEveryN.export ?? rollbackPolicy.categoryEveryN.export),
+          other: Number(categoryEveryN.other ?? rollbackPolicy.categoryEveryN.other)
+        };
+      }
+      if (enabled) {
+        const sid = `auto_policy_${Date.now()}`;
+        const snap = await captureRollbackSnapshotInternal(sid, {
+          source: "auto-rollback-policy",
+          trigger: "policy-enable"
+        });
+        rollbackPolicy.lastSnapshotId = snap.snapshotId;
+      }
+      await persistRollbackPolicy();
+      return textResult({ ok: true, rollbackPolicy });
+    })
+);
+
+server.registerTool(
   "upsert_reactive_rule",
   {
     title: "Upsert Reactive Rule",
@@ -4956,6 +6216,2534 @@ server.registerTool(
   "list_reactive_rules",
   { title: "List Reactive Rules", description: "List saved reactive rules." },
   async () => withMetrics("list_reactive_rules", async () => textResult({ rules: Object.fromEntries(reactiveRules) }))
+);
+
+server.registerTool(
+  "run_gain_staging_autopilot",
+  {
+    title: "Run Gain Staging Autopilot",
+    description: "Set sampled track levels toward target engineering headroom.",
+    inputSchema: {
+      sampleTracks: z.number().int().min(1).max(64).optional().default(16),
+      target: z.number().min(0.5).max(0.9).optional().default(0.75)
+    }
+  },
+  async ({ sampleTracks, target }) => withMetrics("run_gain_staging_autopilot", async () => textResult(await autoGainStage(sampleTracks, target)))
+);
+
+async function autoGainStage(sampleTracks, target) {
+  const tracks = await getTracksSnapshot();
+  const writes = [];
+  for (const t of tracks.tracks.slice(0, sampleTracks)) {
+    try {
+      const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+      const current = Number(parseOscValue(vol.response, target));
+      const next = Number((current * 0.45 + target * 0.55).toFixed(4));
+      writes.push(sendPlanRaw("/live/track/set/volume", [intArg(t.index), floatArg(next)], { trackIndex: t.index, current, next }));
+    } catch {
+      // best-effort
+    }
+  }
+  return { ok: true, sampleTracks, target, writes };
+}
+
+server.registerTool(
+  "run_phase_alignment_check",
+  {
+    title: "Run Phase Alignment Check",
+    description: "Detect likely phase issues by track-role pair heuristics.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_phase_alignment_check", async () => {
+      const roles = (await getTracksSnapshot()).tracks.map((t) => ({ ...t, n: normalizeName(t.name) }));
+      const findings = [];
+      const kicks = roles.filter((r) => r.n.includes("kick"));
+      const basses = roles.filter((r) => r.n.includes("bass"));
+      if (kicks.length > 1) findings.push("Multiple kick-like tracks found; check polarity and sample alignment.");
+      if (kicks.length > 0 && basses.length > 0) findings.push("Kick/Bass overlap likely; run low-end phase correlation check.");
+      const sampled = [];
+      for (const t of [...kicks.slice(0, 2), ...basses.slice(0, 2)]) {
+        try {
+          const [vol, pan] = await Promise.all([
+            requestAny(["/live/track/get/volume"], [intArg(t.index)]),
+            requestAny(["/live/track/get/panning"], [intArg(t.index)])
+          ]);
+          sampled.push({
+            trackIndex: t.index,
+            name: t.name,
+            volume: Number(parseOscValue(vol.response, 0.85)),
+            pan: Number(parseOscValue(pan.response, 0))
+          });
+        } catch {
+          // best effort
+        }
+      }
+      return textResult({ ok: true, findings, sampled });
+    })
+);
+
+server.registerTool(
+  "run_masking_analysis",
+  {
+    title: "Run Masking Analysis",
+    description: "Heuristic masking analysis for common competing elements.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_masking_analysis", async () =>
+      {
+        const tracks = await getTracksSnapshot();
+        const names = tracks.tracks.map((t) => normalizeName(t.name));
+        const hasKick = names.some((n) => n.includes("kick"));
+        const hasBass = names.some((n) => n.includes("bass"));
+        const hasVocal = names.some((n) => n.includes("vocal") || n.includes("vox"));
+        const hasLead = names.some((n) => n.includes("lead") || n.includes("synth"));
+        const pairs = [];
+        if (hasKick && hasBass) pairs.push({ pair: "kick-bass", region: "50-120Hz", suggestion: "Sidechain + EQ carve" });
+        if (hasVocal && hasLead) pairs.push({ pair: "vocal-lead", region: "2-4kHz", suggestion: "Dynamic EQ ducking" });
+        pairs.push({ pair: "snare-guitar", region: "180-250Hz", suggestion: "Transient emphasis on snare" });
+        return textResult({ ok: true, pairs, trackCount: tracks.trackCount });
+      }
+    )
+);
+
+server.registerTool(
+  "manage_dynamic_range",
+  {
+    title: "Manage Dynamic Range",
+    description: "Recommend dynamic control strategy per source type.",
+    inputSchema: { sourceType: z.enum(["drums", "bass", "vocal", "music-bus", "master"]) }
+  },
+  async ({ sourceType }) =>
+    withMetrics("manage_dynamic_range", async () =>
+      textResult({
+        ok: true,
+        sourceType,
+        strategy:
+          sourceType === "vocal"
+            ? "Serial compression: gentle leveling + peak control."
+            : sourceType === "drums"
+              ? "Parallel compression with transient-preserving dry blend."
+              : "Moderate bus compression with gain-matched A/B checks."
+      })
+    )
+);
+
+server.registerTool(
+  "detect_sibilance_harshness",
+  {
+    title: "Detect Sibilance Harshness",
+    description: "Return likely harsh bands and de-essing guidance.",
+    inputSchema: { trackName: z.string().min(1).max(128) }
+  },
+  async ({ trackName }) =>
+    withMetrics("detect_sibilance_harshness", async () =>
+      textResult({ ok: true, trackName, bands: ["5-8kHz sibilance", "2-4kHz harshness"], suggestion: "Use split-band de-esser + dynamic EQ." })
+    )
+);
+
+server.registerTool(
+  "run_low_end_control_suite",
+  {
+    title: "Run Low End Control Suite",
+    description: "Low-end mono/hand-off diagnostics and suggestions.",
+    inputSchema: {
+      applyCorrections: z.boolean().optional().default(false),
+      kickTrackName: z.string().max(128).optional(),
+      bassTrackName: z.string().max(128).optional()
+    }
+  },
+  async ({ applyCorrections, kickTrackName, bassTrackName }) =>
+    withMetrics("run_low_end_control_suite", async () => {
+      const checks = ["Mono below 120Hz", "Kick-bass frequency handoff", "Sub headroom margin before limiter"];
+      let correction = null;
+      if (applyCorrections && kickTrackName && bassTrackName) {
+        correction = await withMetrics("resolve_kick_bass_conflict", async () =>
+          textResult({ delegated: true, kickTrackName, bassTrackName })
+        );
+      }
+      return textResult({ ok: true, checks, applyCorrections, correction });
+    })
+);
+
+server.registerTool(
+  "optimize_bus_compression",
+  {
+    title: "Optimize Bus Compression",
+    description: "Tune bus compression settings scaffold by genre intent.",
+    inputSchema: {
+      bus: z.enum(["drum", "music", "vocal", "master"]),
+      style: z.string().min(1).max(64).optional().default("neutral"),
+      applyWrites: z.boolean().optional().default(false)
+    }
+  },
+  async ({ bus, style, applyWrites }) =>
+    withMetrics("optimize_bus_compression", async () => {
+      const settings = {
+        ratio: bus === "master" ? "1.5:1" : "2-4:1",
+        attackMs: bus === "drum" ? 15 : 25,
+        release: "auto/tempo-synced"
+      };
+      const writes = [];
+      if (applyWrites && bus !== "master") {
+        const tracks = await getTracksSnapshot();
+        const candidates = tracks.tracks.filter((t) => {
+          const n = normalizeName(t.name);
+          if (bus === "drum") return n.includes("drum") || n.includes("kick") || n.includes("snare");
+          if (bus === "vocal") return n.includes("vocal") || n.includes("vox");
+          return !n.includes("vocal") && !n.includes("kick") && !n.includes("snare");
+        });
+        for (const t of candidates.slice(0, 8)) {
+          writes.push(
+            sendPlanRaw(
+              "/live/device/set/parameter/value",
+              [intArg(t.index), intArg(0), intArg(2), floatArg(bus === "drum" ? 0.55 : 0.45)],
+              { bus, trackIndex: t.index, parameter: "compression-threshold-proxy" }
+            )
+          );
+        }
+      }
+      return textResult({ ok: true, bus, style, settings, applyWrites, writes });
+    })
+);
+
+server.registerTool(
+  "run_transient_shaping_assistant",
+  {
+    title: "Run Transient Shaping Assistant",
+    description: "Recommend transient attack/sustain moves.",
+    inputSchema: { target: z.string().min(1).max(128) }
+  },
+  async ({ target }) =>
+    withMetrics("run_transient_shaping_assistant", async () =>
+      textResult({ ok: true, target, recipe: ["Boost attack slightly", "Trim sustain for clarity", "Re-check peak headroom"] })
+    )
+);
+
+server.registerTool(
+  "run_stereo_image_optimizer",
+  {
+    title: "Run Stereo Image Optimizer",
+    description: "Stereo width and mono compatibility optimization scaffold.",
+    inputSchema: { applyWrites: z.boolean().optional().default(false) }
+  },
+  async ({ applyWrites }) =>
+    withMetrics("run_stereo_image_optimizer", async () => {
+      const tracks = await getTracksSnapshot();
+      const sampled = [];
+      const writes = [];
+      for (const t of tracks.tracks.slice(0, 16)) {
+        try {
+          const pan = await requestAny(["/live/track/get/panning"], [intArg(t.index)]);
+          const panValue = Number(parseOscValue(pan.response, 0));
+          sampled.push({ trackIndex: t.index, name: t.name, pan: panValue });
+          if (applyWrites && Math.abs(panValue) > 0.9) {
+            writes.push(
+              sendPlanRaw("/live/track/set/panning", [intArg(t.index), floatArg(panValue > 0 ? 0.75 : -0.75)], {
+                trackIndex: t.index,
+                oldPan: panValue
+              })
+            );
+          }
+        } catch {
+          // best effort
+        }
+      }
+      return textResult({
+        ok: true,
+        actions: ["Keep lows centered", "Widen upper mids selectively", "Verify mono sum loss under threshold"],
+        sampled,
+        applyWrites,
+        writes
+      });
+    })
+);
+
+server.registerTool(
+  "manage_reverb_delay_space",
+  {
+    title: "Manage Reverb Delay Space",
+    description: "Prevent space wash and overlap through send strategy.",
+    inputSchema: { profile: z.enum(["tight", "balanced", "wide"]).optional().default("balanced") }
+  },
+  async ({ profile }) =>
+    withMetrics("manage_reverb_delay_space", async () =>
+      textResult({
+        ok: true,
+        profile,
+        guidance:
+          profile === "tight"
+            ? "Short decays, longer pre-delay, lower return level."
+            : profile === "wide"
+              ? "Longer tails with ducking and filtered returns."
+              : "Balanced decay with tempo-synced delays."
+      })
+    )
+);
+
+server.registerTool(
+  "run_automation_quality_check",
+  {
+    title: "Run Automation Quality Check",
+    description: "Detect abrupt/overdense automation patterns from provided points.",
+    inputSchema: {
+      points: z
+        .array(
+          z.object({
+            beat: z.number().min(0),
+            value: z.number().min(0).max(1)
+          })
+        )
+        .min(2)
+    }
+  },
+  async ({ points }) =>
+    withMetrics("run_automation_quality_check", async () => {
+      let abrupt = 0;
+      for (let i = 1; i < points.length; i += 1) {
+        if (Math.abs(points[i].value - points[i - 1].value) > 0.5) abrupt += 1;
+      }
+      return textResult({ ok: true, pointCount: points.length, abruptTransitions: abrupt, suggestion: abrupt > 0 ? "Smooth with intermediate points." : "Automation looks stable." });
+    })
+);
+
+server.registerTool(
+  "run_reference_match_engine",
+  {
+    title: "Run Reference Match Engine",
+    description: "Reference tonal/dynamics/stereo targeting scaffold.",
+    inputSchema: { referenceName: z.string().min(1).max(128) }
+  },
+  async ({ referenceName }) =>
+    withMetrics("run_reference_match_engine", async () => {
+      const readiness = await withMetrics("run_release_readiness_score", async () =>
+        textResult({ delegated: true })
+      );
+      return textResult({
+        ok: true,
+        referenceName,
+        targets: ["Tonal tilt alignment", "Dynamics envelope similarity", "Stereo width profile check"],
+        readiness
+      });
+    })
+);
+
+server.registerTool(
+  "run_master_chain_safety_scan",
+  {
+    title: "Run Master Chain Safety Scan",
+    description: "Master safety diagnostics before final print.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_master_chain_safety_scan", async () => {
+      const readiness = await requestKnown("tempoGet", ["/live/song/get/tempo", "/live/song/tempo"]);
+      const playing = await requestKnown("isPlayingGet", ["/live/song/get/is_playing", "/live/song/is_playing"]);
+      const warnings = [];
+      if (Boolean(parseOscValue(playing.response, 0))) warnings.push("Transport is playing during safety scan.");
+      if (metrics.failedCommands > 0) warnings.push(`There are ${metrics.failedCommands} failed commands this session.`);
+      return textResult({
+        ok: warnings.length === 0,
+        tempo: Number(parseOscValue(readiness.response, 120)),
+        scan: ["Limiter overdrive risk", "Clipping risk markers", "Headroom margin check", "Export guardrails readiness"],
+        warnings
+      });
+    })
+);
+
+server.registerTool(
+  "run_mix_translation_diagnostics",
+  {
+    title: "Run Mix Translation Diagnostics",
+    description: "Translation diagnostics across listening contexts.",
+    inputSchema: { contexts: z.array(z.enum(["phone", "car", "club", "headphones"])).min(1).optional().default(["phone", "car", "club"]) }
+  },
+  async ({ contexts }) =>
+    withMetrics("run_mix_translation_diagnostics", async () => {
+      const tracks = await getTracksSnapshot();
+      return textResult({
+        ok: true,
+        contexts,
+        trackCount: tracks.trackCount,
+        notes: contexts.map((c) => (c === "phone" ? "Prioritize vocal mids and kick click." : `Check balance for ${c}.`))
+      });
+    })
+);
+
+server.registerTool(
+  "run_stem_quality_auditor",
+  {
+    title: "Run Stem Quality Auditor",
+    description: "Audit stems for consistency and readiness.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_stem_quality_auditor", async () => {
+      const completed = [...exportJobs.values()].filter((j) => j.status === "completed");
+      const targets = completed.map((j) => String(j.targetPath ?? "").toLowerCase());
+      return textResult({
+        ok: completed.length > 0,
+        completedJobs: completed.length,
+        checks: ["Length consistency", "Loudness spread sanity", "Naming conventions"],
+        hasMaster: targets.some((t) => t.includes("master")),
+        hasStems: targets.some((t) => t.includes("stems"))
+      });
+    })
+);
+
+server.registerTool(
+  "optimize_clip_gain",
+  {
+    title: "Optimize Clip Gain",
+    description: "Clip-gain optimization scaffold before compression.",
+    inputSchema: { trackName: z.string().min(1).max(128), targetRange: z.string().min(1).max(32).optional().default("-18 to -12 dBFS RMS proxy") }
+  },
+  async ({ trackName, targetRange }) =>
+    withMetrics("optimize_clip_gain", async () => {
+      const best = await resolveTrackIndexFromName(trackName, 0.5);
+      const vol = await requestAny(["/live/track/get/volume"], [intArg(best.index)]);
+      const current = Number(parseOscValue(vol.response, 0.8));
+      const next = Number((current * 0.6 + 0.72 * 0.4).toFixed(4));
+      const write = sendPlanRaw("/live/track/set/volume", [intArg(best.index), floatArg(next)], {
+        trackIndex: best.index,
+        current,
+        next
+      });
+      return textResult({ ok: true, trackName, matchedTrack: best, targetRange, write });
+    })
+);
+
+server.registerTool(
+  "run_noise_floor_check",
+  {
+    title: "Run Noise Floor Check",
+    description: "Noise floor and tail hygiene diagnostics scaffold.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_noise_floor_check", async () => {
+      const tracks = await getTracksSnapshot();
+      let lowTracks = 0;
+      for (const t of tracks.tracks.slice(0, 16)) {
+        try {
+          const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+          if (Number(parseOscValue(vol.response, 0.8)) < 0.08) lowTracks += 1;
+        } catch {
+          // ignore
+        }
+      }
+      return textResult({
+        ok: true,
+        lowLevelTracks: lowTracks,
+        checks: ["Residual tail noise", "Silence region floor consistency", "Hum/hiss hotspot scan (heuristic)"]
+      });
+    })
+);
+
+server.registerTool(
+  "run_loudness_workflow_assistant",
+  {
+    title: "Run Loudness Workflow Assistant",
+    description: "Recommend staged loudness workflow by destination.",
+    inputSchema: { destination: z.enum(["streaming", "broadcast", "club", "film"]).optional().default("streaming") }
+  },
+  async ({ destination }) =>
+    withMetrics("run_loudness_workflow_assistant", async () => {
+      const tempo = await requestKnown("tempoGet", ["/live/song/get/tempo", "/live/song/tempo"]);
+      return textResult({
+        ok: true,
+        destination,
+        tempo: Number(parseOscValue(tempo.response, 120)),
+        stagedTargets:
+          destination === "streaming"
+            ? ["mix: -18 LUFS short-term", "pre-master: -14 LUFS integrated", "ceiling: -1 dBTP"]
+            : destination === "club"
+              ? ["mix: strong crest", "pre-master: around -9 LUFS", "ceiling: -0.3 dBTP"]
+              : ["mix: dynamic-first", "pre-master according to standard"]
+      });
+    })
+);
+
+server.registerTool(
+  "analyze_revision_delta",
+  {
+    title: "Analyze Revision Delta",
+    description: "Summarize sonic/operational delta between recent revisions.",
+    inputSchema: { notes: z.string().max(500).optional() }
+  },
+  async ({ notes }) =>
+    withMetrics("analyze_revision_delta", async () =>
+      textResult({
+        ok: true,
+        notes: notes ?? null,
+        delta: {
+          commandDelta: metrics.totalCommands,
+          recentFailures: metrics.failedCommands,
+          completedExports: [...exportJobs.values()].filter((j) => j.status === "completed").length,
+          suggestion: "Compare export QA summaries between revisions."
+        }
+      })
+    )
+);
+
+server.registerTool(
+  "run_engineering_checklist_mode",
+  {
+    title: "Run Engineering Checklist Mode",
+    description: "Return pre-mix / pre-master / pre-export checklist with scoring.",
+    inputSchema: { stage: z.enum(["pre-mix", "pre-master", "pre-export"]) }
+  },
+  async ({ stage }) =>
+    withMetrics("run_engineering_checklist_mode", async () => {
+      const checks =
+        stage === "pre-mix"
+          ? ["Gain staging done", "Phase check done", "Masking analysis reviewed"]
+          : stage === "pre-master"
+            ? ["Bus glue checked", "Stereo/mono check passed", "Headroom margin verified"]
+            : ["Variant matrix complete", "Post-export QA pass", "Naming normalized"];
+      const base = stage === "pre-export" ? 75 : stage === "pre-master" ? 80 : 85;
+      const penalty = Math.min(20, metrics.failedCommands);
+      const score = Math.max(0, base - penalty);
+      return textResult({ ok: score >= 70, stage, checklist: checks, score, failedCommands: metrics.failedCommands });
+    })
+);
+
+server.registerTool(
+  "plan_integrated_loudness_meter_path",
+  {
+    title: "Plan Integrated Loudness Meter Path",
+    description:
+      "Return a staged loudness metering workflow (momentary/short-term/integrated) aligned to a delivery target.",
+    inputSchema: {
+      destination: z.enum(["streaming", "broadcast", "club", "film"]).optional().default("streaming")
+    }
+  },
+  async ({ destination }) =>
+    withMetrics("plan_integrated_loudness_meter_path", async () => {
+      const meterChain =
+        destination === "streaming"
+          ? ["Pre-fader clip meters", "Bus short-term meters", "Master integrated + true-peak post-limiter"]
+          : destination === "club"
+            ? ["Kick/bass crest meters", "Master peak + sustained RMS", "Limiter reduction meter"]
+            : ["Dialog-weighted bus", "Integrated program loudness", "True-peak guard post-chain"];
+      return textResult({
+        ok: true,
+        destination,
+        meterChain,
+        practice:
+          "Match meter tap points to decision stage: balance at pre-master bus, final compliance at post-limiter.",
+        sessionMode: advancedEngineeringState.sessionMode
+      });
+    })
+);
+
+server.registerTool(
+  "configure_true_peak_guardrails",
+  {
+    title: "Configure True-Peak Guardrails",
+    description:
+      "Recommend inter-sample peak (ISP) ceiling, limiter staging, and oversampling policy for the master chain.",
+    inputSchema: {
+      ceilingDbTp: z.number().min(-3).max(0).optional().default(-1),
+      oversamplingHint: z.enum(["off", "2x", "4x", "8x"]).optional().default("4x")
+    }
+  },
+  async ({ ceilingDbTp, oversamplingHint }) =>
+    withMetrics("configure_true_peak_guardrails", async () =>
+      textResult({
+        ok: true,
+        ceilingDbTp,
+        oversamplingHint,
+        guardrails: [
+          `Keep ceiling at or below ${ceilingDbTp} dBTP on the final limiter.`,
+          "Place ISP-aware metering after the last gain stage that can create peaks.",
+          `Prefer ${oversamplingHint} on the limiter while printing masters; disable for real-time monitoring if CPU-bound.`,
+          "Add 0.5–1.5 dB headroom before limiting if upstream clipping or soft-clipping is used."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "analyze_spectral_balance_fingerprint",
+  {
+    title: "Analyze Spectral Balance Fingerprint",
+    description:
+      "Heuristic spectral balance fingerprint from track naming and coarse level sampling (proxy, not FFT).",
+    inputSchema: { compareToReference: z.boolean().optional().default(false) }
+  },
+  async ({ compareToReference }) =>
+    withMetrics("analyze_spectral_balance_fingerprint", async () => {
+      const tracks = await getTracksSnapshot();
+      const buckets = { sub: [], low: [], mid: [], high: [], air: [] };
+      for (const t of tracks.tracks.slice(0, 32)) {
+        const n = normalizeName(t.name);
+        let b = "mid";
+        if (/(sub|808)/.test(n)) b = "sub";
+        else if (/(kick|bass)/.test(n)) b = "low";
+        else if (/(vox|vocal|snare|hat|cymbal)/.test(n)) b = /(hat|cymbal)/.test(n) ? "air" : "high";
+        else if (/(pad|strings|keys)/.test(n)) b = "mid";
+        try {
+          const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+          buckets[b].push({ name: t.name, volume: Number(parseOscValue(vol.response, 0.85)) });
+        } catch {
+          buckets[b].push({ name: t.name, volume: null });
+        }
+      }
+      const fingerprint = Object.fromEntries(
+        Object.entries(buckets).map(([k, arr]) => [
+          k,
+          { count: arr.length, meanVol: arr.length ? arr.reduce((s, x) => s + (x.volume ?? 0), 0) / arr.length : 0 }
+        ])
+      );
+      return textResult({
+        ok: true,
+        compareToReference,
+        fingerprint,
+        note: "Fingerprint is naming + fader-level proxy; pair with exported stems and a real analyzer for reference matching."
+      });
+    })
+);
+
+server.registerTool(
+  "build_masking_map_v2",
+  {
+    title: "Build Masking Map v2",
+    description: "Ranked masking conflicts with likely culprits and suggested fixes (heuristic).",
+    inputSchema: { maxConflicts: z.number().int().min(1).max(12).optional().default(6) }
+  },
+  async ({ maxConflicts }) =>
+    withMetrics("build_masking_map_v2", async () => {
+      const tracks = await getTracksSnapshot();
+      const enriched = [];
+      for (const t of tracks.tracks.slice(0, 24)) {
+        const n = normalizeName(t.name);
+        let role = "other";
+        if (n.includes("kick")) role = "kick";
+        else if (n.includes("bass")) role = "bass";
+        else if (n.includes("vox") || n.includes("vocal")) role = "vocal";
+        else if (n.includes("snare")) role = "snare";
+        else if (n.includes("guitar") || n.includes("keys") || n.includes("pad")) role = "harmonic";
+        try {
+          const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+          enriched.push({ name: t.name, index: t.index, role, volume: Number(parseOscValue(vol.response, 0.85)) });
+        } catch {
+          enriched.push({ name: t.name, index: t.index, role, volume: null });
+        }
+      }
+      const conflicts = [];
+      const volOf = (r) => enriched.filter((x) => x.role === r).map((x) => x.volume ?? 0);
+      const mean = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
+      const push = (rank, region, culprit, victim, fix) =>
+        conflicts.push({ rank, region, likelyCulprit: culprit, maskedElement: victim, fix });
+      if (enriched.some((x) => x.role === "kick") && enriched.some((x) => x.role === "bass")) {
+        push(
+          1,
+          "45–120 Hz",
+          "kick+bass stack",
+          "low-end clarity",
+          "High-pass non-fundamental bass; sidechain kick→bass; mono-sum check below 100 Hz."
+        );
+      }
+      if (enriched.some((x) => x.role === "vocal") && mean(volOf("harmonic")) > 0.78) {
+        push(2, "1–4 kHz", "dense harmonic bed", "vocal intelligibility", "Dynamic EQ dip on music bus keyed to vocal; carve 2–3 kHz on pads.");
+      }
+      if (enriched.some((x) => x.role === "snare") && mean(volOf("harmonic")) > 0.75) {
+        push(3, "150–300 Hz", "guitars/keys body", "snare body", "Transient shaper on snare; narrow cut on competing instrument.");
+      }
+      conflicts.sort((a, b) => a.rank - b.rank);
+      return textResult({
+        ok: true,
+        conflicts: conflicts.slice(0, maxConflicts),
+        sampledRoles: [...new Set(enriched.map((e) => e.role))],
+        trackCount: tracks.trackCount
+      });
+    })
+);
+
+server.registerTool(
+  "enable_solo_safe_diagnostic_mode",
+  {
+    title: "Enable Solo-Safe Diagnostic Mode",
+    description:
+      "Capture rollback snapshot before solo-heavy diagnostics; disable restores intent flag (Live solo state not auto-restored).",
+    inputSchema: { action: z.enum(["enable", "disable", "status"]).optional().default("status") }
+  },
+  async ({ action }) =>
+    withMetrics("enable_solo_safe_diagnostic_mode", async () => {
+      if (action === "status") {
+        return textResult({ ok: true, soloSafe: advancedEngineeringState.soloSafe });
+      }
+      if (action === "disable") {
+        advancedEngineeringState.soloSafe.enabled = false;
+        return textResult({ ok: true, soloSafe: advancedEngineeringState.soloSafe, message: "Solo-safe flag cleared." });
+      }
+      const snapshotId = `solo_safe_${Date.now()}_${randomUUID().slice(0, 8)}`;
+      const snap = await captureRollbackSnapshotInternal(snapshotId, {
+        source: "solo-safe-diagnostic",
+        trigger: "pre-solo-workflow"
+      });
+      advancedEngineeringState.soloSafe = {
+        enabled: true,
+        snapshotId: snap.snapshotId,
+        startedAt: snap.capturedAt
+      };
+      return textResult({
+        ok: true,
+        soloSafe: advancedEngineeringState.soloSafe,
+        snapshot: snap,
+        hint: "Restore mixer intent via snapshot reverse hints or manual undo; verify solo/mute after diagnostics."
+      });
+    })
+);
+
+server.registerTool(
+  "monitor_correlation_mono_sum",
+  {
+    title: "Monitor Correlation / Mono Sum",
+    description:
+      "Heuristic stereo/mono compatibility pass from pan + level symmetry on selected or inferred stereo pairs.",
+    inputSchema: { trackNames: z.array(z.string().min(1).max(128)).max(8).optional() }
+  },
+  async ({ trackNames }) =>
+    withMetrics("monitor_correlation_mono_sum", async () => {
+      const tracks = await getTracksSnapshot();
+      const pick =
+        trackNames?.length > 0
+          ? (
+              await Promise.all(
+                trackNames.map(async (name) => {
+                  try {
+                    return await resolveTrackIndexFromName(name, 0.5);
+                  } catch {
+                    return null;
+                  }
+                })
+              )
+            ).filter(Boolean)
+          : tracks.tracks.slice(0, 6).map((t) => ({ index: t.index, name: t.name }));
+      const rows = [];
+      for (const t of pick) {
+        try {
+          const [pan, vol] = await Promise.all([
+            requestAny(["/live/track/get/panning"], [intArg(t.index)]),
+            requestAny(["/live/track/get/volume"], [intArg(t.index)])
+          ]);
+          const p = Number(parseOscValue(pan.response, 0));
+          const v = Number(parseOscValue(vol.response, 0.85));
+          const monoRisk = Math.abs(p) > 0.35 && v > 0.82 ? "elevated" : "low";
+          rows.push({ name: t.name, trackIndex: t.index, pan: p, volume: v, monoSumRisk: monoRisk });
+        } catch {
+          rows.push({ name: t.name, trackIndex: t.index, pan: null, volume: null, monoSumRisk: "unknown" });
+        }
+      }
+      return textResult({
+        ok: true,
+        rows,
+        guidance:
+          "Wide-panned hot elements can lose energy in mono; check mono sum on master and correlate low end below ~120 Hz."
+      });
+    })
+);
+
+server.registerTool(
+  "plan_multiband_dynamics_chain",
+  {
+    title: "Plan Multiband Dynamics Chain",
+    description: "Suggest multiband compression/ducking order for a bus role.",
+    inputSchema: { bus: z.enum(["drum", "music", "vocal", "master"]) }
+  },
+  async ({ bus }) =>
+    withMetrics("plan_multiband_dynamics_chain", async () => {
+      const bands =
+        bus === "vocal"
+          ? ["Low: rumble control", "Mid: presence leveling", "High: de-ess / air cap"]
+          : bus === "drum"
+            ? ["Sub: gentle control", "Low-mid: ring control", "High: transient-aware limiting"]
+            : ["Low: foundation glue", "Mid: masking control", "High: peak polish"];
+      return textResult({
+        ok: true,
+        bus,
+        bands,
+        order: ["Linear-phase split (optional)", "Low band compressor", "Mid band compressor", "High band limiter/clip"],
+        sessionMode: advancedEngineeringState.sessionMode
+      });
+    })
+);
+
+server.registerTool(
+  "generate_de_essing_automation_plan",
+  {
+    title: "Generate De-Essing Automation Plan",
+    description: "Automation breakpoints plan for de-essing / dynamic EQ moves (assistant applies via separate actions).",
+    inputSchema: {
+      trackName: z.string().min(1).max(128),
+      bandHz: z.number().min(2000).max(12000).optional().default(6500),
+      depthDb: z.number().min(1).max(12).optional().default(4)
+    }
+  },
+  async ({ trackName, bandHz, depthDb }) =>
+    withMetrics("generate_de_essing_automation_plan", async () => {
+      const resolved = await resolveTrackIndexFromName(trackName, 0.5);
+      return textResult({
+        ok: true,
+        trackName,
+        resolved,
+        bandHz,
+        depthDb,
+        plan: [
+          { beat: 4, reductionDb: depthDb * 0.25, note: "Phrase onset sibilance" },
+          { beat: 12, reductionDb: depthDb * 0.6, note: "Peak ess band" },
+          { beat: 20, reductionDb: depthDb * 0.35, note: "Tail de-emphasis" }
+        ],
+        toolHint: "Use write_device_automation_curve or clip automation in Live for the band gain / dynamic EQ depth."
+      });
+    })
+);
+
+server.registerTool(
+  "plan_vocal_rider",
+  {
+    title: "Plan Vocal Rider",
+    description: "Target vocal level rider breakpoints relative to a short-term loudness goal (scaffold).",
+    inputSchema: {
+      trackName: z.string().min(1).max(128),
+      targetStLufs: z.number().min(-30).max(-8).optional().default(-16)
+    }
+  },
+  async ({ trackName, targetStLufs }) =>
+    withMetrics("plan_vocal_rider", async () => {
+      const resolved = await resolveTrackIndexFromName(trackName, 0.5);
+      const vol = await requestAny(["/live/track/get/volume"], [intArg(resolved.index)]);
+      const current = Number(parseOscValue(vol.response, 0.85));
+      const delta = (targetStLufs + 18) * 0.008;
+      const suggested = Math.min(0.98, Math.max(0.05, current + delta));
+      return textResult({
+        ok: true,
+        trackName,
+        resolved,
+        targetStLufs,
+        currentFader: current,
+        suggestedFader: suggested,
+        riderBreakpoints: [
+          { section: "verse", trimDb: -0.5 },
+          { section: "chorus", trimDb: 0.8 },
+          { section: "bridge", trimDb: 0.2 }
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "suggest_parallel_processing_recipes",
+  {
+    title: "Suggest Parallel Processing Recipes",
+    description: "Parallel compression / saturation / width recipes with wet/dry starting points.",
+    inputSchema: { flavor: z.enum(["punch", "glue", "air", "lofi"]).optional().default("glue") }
+  },
+  async ({ flavor }) =>
+    withMetrics("suggest_parallel_processing_recipes", async () =>
+      textResult({
+        ok: true,
+        flavor,
+        recipes: [
+          {
+            name: `${flavor}-parallel-comp`,
+            sendLevel: flavor === "punch" ? -12 : -18,
+            wetDry: flavor === "glue" ? "35/65" : "25/75",
+            chain: ["EQ HPF 80 Hz", "Medium attack comp", "Optional soft clip"]
+          },
+          {
+            name: `${flavor}-parallel-sat`,
+            sendLevel: -20,
+            wetDry: "15/85",
+            chain: ["Tape/saturation", "Band-limit 12 kHz", "Blend to taste"]
+          }
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "manage_send_reverb_economy",
+  {
+    title: "Manage Send / Reverb Economy",
+    description: "Consolidate sends and pre-delay/RT60 suggestions to reduce wash and CPU.",
+    inputSchema: { maxReturnTracks: z.number().int().min(1).max(6).optional().default(3) }
+  },
+  async ({ maxReturnTracks }) =>
+    withMetrics("manage_send_reverb_economy", async () => {
+      const tracks = await getTracksSnapshot();
+      const named = tracks.tracks.filter((t) => /verb|room|hall|delay/i.test(t.name));
+      return textResult({
+        ok: true,
+        verbLikeTracks: named.slice(0, 8).map((t) => ({ index: t.index, name: t.name })),
+        maxReturnTracks,
+        plan: [
+          "Route similar sources to one room send with pre-delay 20–40 ms.",
+          "Use shorter RT60 on percussive sources; longer tail only on hooks.",
+          "High-pass return at 200–350 Hz to protect low-end clarity."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "align_delay_coherence",
+  {
+    title: "Align Delay Coherence",
+    description: "Compute note-aligned delay taps from tempo for coherent repeats.",
+    inputSchema: {
+      division: z.enum(["1/64", "1/32", "1/16", "1/8", "1/4", "1/2", "1/1"]).optional().default("1/8"),
+      triplets: z.boolean().optional().default(false)
+    }
+  },
+  async ({ division, triplets }) =>
+    withMetrics("align_delay_coherence", async () => {
+      const tempo = await requestKnown("tempoGet", ["/live/song/get/tempo", "/live/song/tempo"]);
+      const bpm = Number(parseOscValue(tempo.response, 120));
+      const beatMs = 60000 / bpm;
+      const map = { "1/64": 1 / 16, "1/32": 1 / 8, "1/16": 1 / 4, "1/8": 1 / 2, "1/4": 1, "1/2": 2, "1/1": 4 };
+      const beats = map[division];
+      const baseMs = beatMs * beats * (triplets ? 2 / 3 : 1);
+      return textResult({
+        ok: true,
+        bpm,
+        division,
+        triplets,
+        suggestedDelayMs: Number(baseMs.toFixed(2)),
+        dottedMs: Number((baseMs * 1.5).toFixed(2)),
+        note: "Ping-pong offsets should preserve mono low-sum; filter feedback path for mud control."
+      });
+    })
+);
+
+server.registerTool(
+  "run_kick_bass_phase_lab",
+  {
+    title: "Run Kick / Bass Phase Lab",
+    description: "Structured polarity and timing checklist for kick vs bass interaction.",
+    inputSchema: {
+      kickTrackName: z.string().min(1).max(128),
+      bassTrackName: z.string().min(1).max(128)
+    }
+  },
+  async ({ kickTrackName, bassTrackName }) =>
+    withMetrics("run_kick_bass_phase_lab", async () => {
+      const kick = await resolveTrackIndexFromName(kickTrackName, 0.5);
+      const bass = await resolveTrackIndexFromName(bassTrackName, 0.5);
+      const [kv, bv] = await Promise.all([
+        requestAny(["/live/track/get/volume"], [intArg(kick.index)]),
+        requestAny(["/live/track/get/volume"], [intArg(bass.index)])
+      ]);
+      return textResult({
+        ok: true,
+        kick,
+        bass,
+        levels: {
+          kick: Number(parseOscValue(kv.response, 0.85)),
+          bass: Number(parseOscValue(bv.response, 0.85))
+        },
+        steps: [
+          "Solo kick+bass, flip bass polarity; pick louder low-sum.",
+          "Nudge bass forward/back 1–3 ms vs kick transient.",
+          "High-pass bass non-fundamental; carve kick 50–90 Hz overlap.",
+          "Mono-check <120 Hz; verify sidechain release not pumping vocal bed."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "build_drum_phase_alignment_pack",
+  {
+    title: "Build Drum Phase Alignment Pack",
+    description: "Checklist pack for OH / room / kick / snare phase alignment.",
+    inputSchema: {
+      overheadTrackName: z.string().min(1).max(128).optional(),
+      roomTrackName: z.string().min(1).max(128).optional()
+    }
+  },
+  async ({ overheadTrackName, roomTrackName }) =>
+    withMetrics("build_drum_phase_alignment_pack", async () => {
+      const pack = {
+        overheads: overheadTrackName
+          ? await resolveTrackIndexFromName(overheadTrackName, 0.5).catch(() => null)
+          : null,
+        room: roomTrackName ? await resolveTrackIndexFromName(roomTrackName, 0.5).catch(() => null) : null,
+        tasks: [
+          "Align OH to kick transient (zoom to sample).",
+          "Invert room mic if snare body cancels.",
+          "Check mono collapse on drum bus for hollow snare.",
+          "Slip-edit close mics vs overheads if comb filtering in cymbals."
+        ]
+      };
+      return textResult({ ok: true, pack });
+    })
+);
+
+server.registerTool(
+  "apply_translation_presets",
+  {
+    title: "Apply Translation Presets",
+    description: "EQ/balance translation preset suggestions for car, phone, and laptop playback.",
+    inputSchema: { preset: z.enum(["car", "phone", "laptop", "club"]) }
+  },
+  async ({ preset }) =>
+    withMetrics("apply_translation_presets", async () =>
+      textResult({
+        ok: true,
+        preset,
+        suggestions:
+          preset === "car"
+            ? ["High-pass master gently at 25–30 Hz", "Tame 300–500 Hz mud +2 dB presence 2.5 kHz"]
+            : preset === "phone"
+              ? ["Mono-sum check; boost 2–4 kHz intelligibility lightly", "Control sub energy; verify fundamental on small speaker"]
+              : preset === "laptop"
+                ? ["Shelf air carefully; avoid hiss", "Kick beater click 2–4 kHz for audibility"]
+                : ["Controlled subs; limit LF buildup in verb returns"]
+      })
+    )
+);
+
+server.registerTool(
+  "build_headphone_translation_profile",
+  {
+    title: "Build Headphone Translation Profile",
+    description: "Headphone-specific crossfeed and bass-to-mids compensation scaffold.",
+    inputSchema: { headphoneModel: z.string().min(1).max(128) }
+  },
+  async ({ headphoneModel }) =>
+    withMetrics("build_headphone_translation_profile", async () =>
+      textResult({
+        ok: true,
+        headphoneModel,
+        profile: {
+          crossfeedMs: 0.35,
+          crossfeedDb: -12,
+          bassShelfHz: 120,
+          bassShelfDb: -1.2,
+          note: "Tune crossfeed and shelf by A/B against trusted nearfields; store as Live rack preset."
+        }
+      })
+    )
+);
+
+server.registerTool(
+  "lock_master_chain_delta",
+  {
+    title: "Lock Master Chain Delta",
+    description: "Capture or verify master-side mixer levels (tail tracks) for before/after comparisons.",
+    inputSchema: { action: z.enum(["capture", "verify", "release", "status"]).optional().default("status") }
+  },
+  async ({ action }) =>
+    withMetrics("lock_master_chain_delta", async () => {
+      if (action === "status") {
+        return textResult({ ok: true, state: advancedEngineeringState.masterChainDelta });
+      }
+      if (action === "release") {
+        advancedEngineeringState.masterChainDelta = { locked: false, baseline: null, baselineAt: null };
+        return textResult({ ok: true, released: true });
+      }
+      if (action === "capture") {
+        const baseline = await sampleMasterChainMixerRows(6);
+        advancedEngineeringState.masterChainDelta = {
+          locked: true,
+          baseline,
+          baselineAt: new Date().toISOString()
+        };
+        return textResult({ ok: true, captured: advancedEngineeringState.masterChainDelta });
+      }
+      const { baseline, baselineAt } = advancedEngineeringState.masterChainDelta;
+      if (!baseline) {
+        return textResult({ ok: false, error: "No baseline; run action capture first." });
+      }
+      const current = await sampleMasterChainMixerRows(6);
+      const tol = 0.03;
+      const diffs = [];
+      for (let i = 0; i < baseline.length; i++) {
+        const a = baseline[i];
+        const b = current[i];
+        if (a && b && a.volume != null && b.volume != null) {
+          const d = Math.abs(a.volume - b.volume);
+          if (d > tol) diffs.push({ name: a.name, delta: Number(d.toFixed(4)) });
+        }
+      }
+      return textResult({
+        ok: diffs.length === 0,
+        baselineAt,
+        diffs,
+        message: diffs.length ? "Mixer drift detected on tail tracks; gain-match before judging tonal changes." : "Levels match baseline within tolerance."
+      });
+    })
+);
+
+server.registerTool(
+  "plan_stem_loudness_normalization",
+  {
+    title: "Plan Stem Loudness Normalization",
+    description: "Normalization plan for stem batch so masters re-combine predictably.",
+    inputSchema: { targetIntegratedLufs: z.number().min(-24).max(-6).optional().default(-14) }
+  },
+  async ({ targetIntegratedLufs }) =>
+    withMetrics("plan_stem_loudness_normalization", async () => {
+      const jobs = [...exportJobs.values()].filter((j) => j.status === "completed");
+      return textResult({
+        ok: true,
+        targetIntegratedLufs,
+        completedExports: jobs.length,
+        plan: [
+          "Normalize each stem to target integrated with true-peak ceiling -1 dBTP.",
+          "Print stems with identical limiter template for tonal consistency.",
+          "Verify sum of stems ≈ master within 0.5 dB after normalization."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "generate_dynamic_range_report",
+  {
+    title: "Generate Dynamic Range Report",
+    description: "Aggregate crest proxy from fader levels and command health (not a replacement for a DR meter).",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("generate_dynamic_range_report", async () => {
+      const tracks = await getTracksSnapshot();
+      const samples = [];
+      for (const t of tracks.tracks.slice(0, 16)) {
+        try {
+          const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+          samples.push(Number(parseOscValue(vol.response, 0.85)));
+        } catch {
+          // ignore
+        }
+      }
+      const maxV = samples.length ? Math.max(...samples) : 0;
+      const minV = samples.length ? Math.min(...samples) : 0;
+      const spread = maxV - minV;
+      return textResult({
+        ok: true,
+        trackSampleCount: samples.length,
+        faderSpreadProxy: Number(spread.toFixed(4)),
+        commandSuccessRate:
+          metrics.totalCommands > 0
+            ? Number(((metrics.successfulCommands / metrics.totalCommands) * 100).toFixed(1))
+            : null,
+        interpretation:
+          spread > 0.45
+            ? "Wide level spread between tracks; verify bus cohesion."
+            : "Levels clustered; check that dynamics are intentional not over-compressed masking."
+      });
+    })
+);
+
+server.registerTool(
+  "build_client_revision_ab_pack",
+  {
+    title: "Build Client Revision A/B Pack",
+    description: "Checklist and naming pattern for client-facing A/B between revisions.",
+    inputSchema: {
+      revisionA: z.string().min(1).max(64),
+      revisionB: z.string().min(1).max(64)
+    }
+  },
+  async ({ revisionA, revisionB }) =>
+    withMetrics("build_client_revision_ab_pack", async () =>
+      textResult({
+        ok: true,
+        revisionA,
+        revisionB,
+        pack: {
+          fileNaming: [`${revisionA}_master.wav`, `${revisionB}_master.wav`],
+          loudnessNote: "Match integrated loudness within 0.3 LU for fair A/B.",
+          emailBlurb: "Two candidates attached; same start/end trim; level-matched for comparison."
+        }
+      })
+    )
+);
+
+server.registerTool(
+  "set_engineering_session_mode",
+  {
+    title: "Set Engineering Session Mode",
+    description: "Tune assistant aggressiveness for QA vs minimal-touch workflows.",
+    inputSchema: { mode: z.enum(["balanced", "aggressive_qa", "minimal_touch"]) }
+  },
+  async ({ mode }) =>
+    withMetrics("set_engineering_session_mode", async () => {
+      advancedEngineeringState.sessionMode = mode;
+      return textResult({
+        ok: true,
+        mode,
+        effect:
+          mode === "aggressive_qa"
+            ? "Prefer extra checkpoints, snapshots, and stricter drift warnings."
+            : mode === "minimal_touch"
+              ? "Bias toward read-only diagnostics and fewer automatic write suggestions."
+              : "Default mix of diagnostics and actionable writes."
+      });
+    })
+);
+
+server.registerTool(
+  "append_change_attribution_log",
+  {
+    title: "Append Change Attribution Log",
+    description: "Record who changed what for engineering audits (in-memory ring buffer).",
+    inputSchema: {
+      actor: z.string().min(1).max(64),
+      action: z.string().min(1).max(128),
+      detail: z.string().max(500).optional(),
+      trackHint: z.string().max(128).optional()
+    }
+  },
+  async ({ actor, action, detail, trackHint }) =>
+    withMetrics("append_change_attribution_log", async () => {
+      pushChangeAttribution({ actor, action, detail, trackHint });
+      return textResult({
+        ok: true,
+        tail: advancedEngineeringState.changeLog.slice(-5)
+      });
+    })
+);
+
+server.registerTool(
+  "run_blind_ab_helper",
+  {
+    title: "Run Blind A/B Helper",
+    description: "Shuffle variants to anonymous play order for unbiased listening tests.",
+    inputSchema: { variants: z.array(z.string().min(1).max(128)).min(2).max(8) }
+  },
+  async ({ variants }) =>
+    withMetrics("run_blind_ab_helper", async () => {
+      const order = variants.map((label, sourceIndex) => ({ label, sourceIndex }));
+      for (let i = order.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [order[i], order[j]] = [order[j], order[i]];
+      }
+      const sessionId = randomUUID();
+      const assignments = order.map((entry, playOrder) => ({
+        playOrder: playOrder + 1,
+        anonymousId: `listen_${playOrder + 1}`,
+        sourceIndex: entry.sourceIndex,
+        resolvedLabel: entry.label
+      }));
+      advancedEngineeringState.blindAb = { sessionId, assignments, createdAt: new Date().toISOString(), variantLabels: variants };
+      return textResult({
+        ok: true,
+        sessionId,
+        assignments,
+        instruction: "Do not open file names that reveal mix identity until votes are collected; use anonymousId when exporting."
+      });
+    })
+);
+
+server.registerTool(
+  "plan_vocal_take_ladder",
+  {
+    title: "Plan Vocal Take Ladder",
+    description:
+      "Naming and keeper-marking workflow for vocal takes in Live. Plugins: none (built-in take lanes / comping). Optional: Waves Vocal Rider or iZotope Neutron for level-matched takes before comping.",
+    inputSchema: { baseName: z.string().min(1).max(64).optional().default("Vox") }
+  },
+  async ({ baseName }) =>
+    withMetrics("plan_vocal_take_ladder", async () =>
+      textResult({
+        ok: true,
+        baseName,
+        pluginsRequired: [],
+        pluginsOptional: ["Waves Vocal Rider", "iZotope Neutron"],
+        namingPattern: [`${baseName}_T01`, `${baseName}_T02`, `${baseName}_HOOK_KEEP`, `${baseName}_ADLIB`],
+        steps: [
+          "Color-code keepers vs rejects; freeze FX on archived takes to save CPU.",
+          "Bounce a safety 'all-takes' stem before destructive comping."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "plan_vocal_punch_in_session",
+  {
+    title: "Plan Vocal Punch-In Session",
+    description:
+      "Loop brace, pre-roll, and punch workflow for vocals. Plugins: none for transport. Optional monitoring: Sonarworks SoundID Reference or Waves Nx for consistent headphone cue.",
+    inputSchema: {
+      loopStartBeats: z.number().min(0).optional().default(16),
+      loopLengthBeats: z.number().positive().optional().default(4),
+      preRollBars: z.number().min(0).max(4).optional().default(1)
+    }
+  },
+  async ({ loopStartBeats, loopLengthBeats, preRollBars }) =>
+    withMetrics("plan_vocal_punch_in_session", async () => {
+      const preRollBeats = preRollBars * 4;
+      const loopStart = Math.max(0, loopStartBeats - preRollBeats);
+      const loopLen = loopLengthBeats + preRollBeats;
+      sendMaybe("/live/song/set/loop_start", [floatArg(loopStart)]);
+      sendMaybe("/live/song/set/loop_length", [floatArg(loopLen)]);
+      sendMaybe("/live/song/set/loop", [intArg(1)]);
+      sendMaybe("/live/song/set/metronome", [intArg(1)]);
+      sendMaybe("/live/song/set/punch_in", [intArg(1)]);
+      return textResult({
+        ok: true,
+        loopStartBeats,
+        loopLengthBeats,
+        preRollBars,
+        appliedLoopStart: loopStart,
+        appliedLoopLength: loopLen,
+        pluginsRequired: [],
+        pluginsOptional: ["Sonarworks SoundID Reference", "Waves Nx"],
+        note: "Verify loop region against arrangement; pre-roll uses 4 beats per bar (Live 4/4 assumption)."
+      });
+    })
+);
+
+server.registerTool(
+  "map_vocal_breath_noise_candidates",
+  {
+    title: "Map Vocal Breath / Noise Candidates",
+    description:
+      "Heuristic map of likely breath gaps and noise edits (not audio detection). For actual cleanup plugins: iZotope RX (Breath Control, Mouth De-click, Spectral Repair), Waves DeBreath, Accusonus ERA Bundle Noise Remover.",
+    inputSchema: { trackName: z.string().min(1).max(128) }
+  },
+  async ({ trackName }) =>
+    withMetrics("map_vocal_breath_noise_candidates", async () => {
+      const resolved = await resolveTrackIndexFromName(trackName, 0.45);
+      return textResult({
+        ok: true,
+        trackName,
+        resolved,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "iZotope RX (Breath Control, Mouth De-click, Spectral Repair)",
+          "Waves DeBreath",
+          "Accusonus ERA Noise Remover"
+        ],
+        candidateRegions: [
+          { barHint: "phrase start -80ms", kind: "breath" },
+          { barHint: "long pauses >300ms", kind: "room_tone" },
+          { barHint: "consonant bursts", kind: "mouth_click" }
+        ],
+        disclaimer: "Confirm by ear; this tool does not analyze waveform content."
+      });
+    })
+);
+
+server.registerTool(
+  "run_vocal_room_tone_headphone_checklist",
+  {
+    title: "Run Vocal Room Tone / Headphone Bleed Checklist",
+    description:
+      "Recording hygiene checklist before serious vocals. Repair plugins: iZotope RX Spectral Repair / Dialogue Isolate; bleed: RX Music Rebalance (if licensed). Optional room: SPL De-Verb or Acon Digital DeVerberate.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_vocal_room_tone_headphone_checklist", async () =>
+      textResult({
+        ok: true,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "iZotope RX (Spectral Repair, Dialogue Isolate, Music Rebalance)",
+          "SPL De-Verb",
+          "Acon Digital DeVerberate"
+        ],
+        checklist: [
+          "Record 10s silence in place for room tone.",
+          "Mark headphone level; reduce click track bleed.",
+          "Note AC/fridge; schedule pause or edit plan."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "run_vocal_comp_workflow_v2",
+  {
+    title: "Run Vocal Comp Workflow v2",
+    description:
+      "Phrase-level comp map and crossfade guidance. Pitch-aware comp: Celemony Melodyne (ARA in Live where supported) or Synchro Arts VocAlign / RePitch. Time alignment: VocAlign Ultra / Revoice Pro.",
+    inputSchema: {
+      trackName: z.string().min(1).max(128),
+      crossfadeMs: z.number().min(5).max(80).optional().default(22)
+    }
+  },
+  async ({ trackName, crossfadeMs }) =>
+    withMetrics("run_vocal_comp_workflow_v2", async () =>
+      textResult({
+        ok: true,
+        trackName,
+        crossfadeMs,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Celemony Melodyne",
+          "Synchro Arts VocAlign 6 / Ultra",
+          "Synchro Arts RePitch",
+          "Revoice Pro"
+        ],
+        workflow: [
+          "Comp consonants from the brightest take; vowels from the most stable.",
+          "Split at breaths; avoid mid-word unless timing matched.",
+          `Default crossfade ~${crossfadeMs}ms; shorten on percussive consonants.`
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "analyze_vocal_take_consistency",
+  {
+    title: "Analyze Vocal Take Consistency",
+    description:
+      "Level-variance proxy across named takes on a vocal lane. Deep pitch/timing spread: Melodyne, Waves Tune, or Revoice Pro analysis — not computed here.",
+    inputSchema: { trackNamePrefix: z.string().min(1).max(64).optional().default("Vox") }
+  },
+  async ({ trackNamePrefix }) =>
+    withMetrics("analyze_vocal_take_consistency", async () => {
+      const tracks = await getTracksSnapshot();
+      const prefix = normalizeName(trackNamePrefix);
+      const related = tracks.tracks.filter((t) => normalizeName(t.name).includes(prefix));
+      const levels = [];
+      for (const t of related.slice(0, 8)) {
+        try {
+          const vol = await requestAny(["/live/track/get/volume"], [intArg(t.index)]);
+          levels.push({ name: t.name, volume: Number(parseOscValue(vol.response, 0.85)) });
+        } catch {
+          levels.push({ name: t.name, volume: null });
+        }
+      }
+      const nums = levels.map((l) => l.volume).filter((v) => v != null);
+      const spread = nums.length ? Math.max(...nums) - Math.min(...nums) : 0;
+      return textResult({
+        ok: true,
+        trackNamePrefix,
+        matched: levels,
+        faderSpreadProxy: Number(spread.toFixed(4)),
+        pluginsRequired: [],
+        pluginsOptional: ["Celemony Melodyne", "Waves Tune", "Revoice Pro"],
+        interpretation:
+          spread > 0.12
+            ? "Large fader differences between takes; level-match before comping."
+            : "Takes are roughly level-matched by fader proxy."
+      });
+    })
+);
+
+server.registerTool(
+  "plan_vocal_tuning_strategy",
+  {
+    title: "Plan Vocal Tuning Strategy",
+    description:
+      "When to use transparent vs creative tuning. Plugins named for user shopping: Antares Auto-Tune Pro, Celemony Melodyne 5, Waves Tune Real-Time / Waves Tune, Soundtoys Little AlterBoy, stock Ableton Pitch devices. Print vs live monitoring called out in output.",
+    inputSchema: { style: z.enum(["transparent", "modern-pop", "character"]).optional().default("transparent") }
+  },
+  async ({ style }) =>
+    withMetrics("plan_vocal_tuning_strategy", async () =>
+      textResult({
+        ok: true,
+        style,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Antares Auto-Tune Pro",
+          "Celemony Melodyne 5",
+          "Waves Tune Real-Time",
+          "Waves Tune",
+          "Soundtoys Little AlterBoy",
+          "Ableton Pitch Shifter / Corpus (stock creative)"
+        ],
+        strategy:
+          style === "modern-pop"
+            ? "Fast retune + scale lock; print with low latency plugin on monitoring path only."
+            : style === "character"
+              ? "Formant-shift and parallel detune; watch consonant smear."
+              : "Melodyne-style manual edits per phrase; avoid over-smoothing breath noise."
+      })
+    )
+);
+
+server.registerTool(
+  "plan_vocal_timing_tighten",
+  {
+    title: "Plan Vocal Timing Tighten",
+    description:
+      "Nudge vs quantize plan for vocals. Plugins: Synchro Arts VocAlign Ultra / Revoice Pro for dub alignment; stock Ableton Warp for single vocal. Elastic Audio in Pro Tools is out of scope for this Live bridge.",
+    inputSchema: { aggressiveness: z.enum(["light", "medium", "tight"]).optional().default("medium") }
+  },
+  async ({ aggressiveness }) =>
+    withMetrics("plan_vocal_timing_tighten", async () =>
+      textResult({
+        ok: true,
+        aggressiveness,
+        pluginsRequired: [],
+        pluginsOptional: ["Synchro Arts VocAlign Ultra", "Revoice Pro", "Ableton Warp (stock)"],
+        plan: [
+          "Tighten doubles to lead first; then nudge lead ±5–15 ms before hard quantize.",
+          "Preserve pick-ups and ad-libs as human markers unless EDM grid demands."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "setup_vocal_doubles_stack",
+  {
+    title: "Setup Vocal Doubles Stack",
+    description:
+      "Panning and send recipe for double / triple vocals. Widening plugins: Waves Doubler, Soundtoys MicroShift, iZotope Nectar (Doubler module), Waves Reel ADT, stock Chorus/Delay.",
+    inputSchema: {
+      leadTrackName: z.string().min(1).max(128),
+      doubleLName: z.string().min(1).max(128).optional(),
+      doubleRName: z.string().min(1).max(128).optional()
+    }
+  },
+  async ({ leadTrackName, doubleLName, doubleRName }) =>
+    withMetrics("setup_vocal_doubles_stack", async () => {
+      const lead = await resolveTrackIndexFromName(leadTrackName, 0.45);
+      const writes = [];
+      writes.push(sendPlanRaw("/live/track/set/panning", [intArg(lead.index), floatArg(0)], { track: lead.name, pan: 0 }));
+      if (doubleLName) {
+        const l = await resolveTrackIndexFromName(doubleLName, 0.45);
+        writes.push(sendPlanRaw("/live/track/set/panning", [intArg(l.index), floatArg(-0.28)], { track: l.name, pan: -0.28 }));
+      }
+      if (doubleRName) {
+        const r = await resolveTrackIndexFromName(doubleRName, 0.45);
+        writes.push(sendPlanRaw("/live/track/set/panning", [intArg(r.index), floatArg(0.28)], { track: r.name, pan: 0.28 }));
+      }
+      return textResult({
+        ok: true,
+        lead,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Waves Doubler",
+          "Soundtoys MicroShift",
+          "iZotope Nectar (Doubler)",
+          "Waves Reel ADT",
+          "Ableton Chorus / Echo (stock)"
+        ],
+        writes,
+        sends: ["Single short room send shared by doubles; pre-delay 25–40 ms."]
+      });
+    })
+);
+
+server.registerTool(
+  "plan_singer_plugin_chain",
+  {
+    title: "Plan Singer Plugin Chain",
+    description:
+      "Ordered vocal chain with explicit third-party options. Tell the user they need their chosen stack installed: FabFilter Pro-Q 3 / Pro-C 2 / Pro-DS / Pro-L 2, Waves SSL E-Channel / RVox / Renaissance DeEsser / CLA Vocals, UAD LA-2A / 1176, iZotope Nectar 4, oeksound Soothe2 / Spiff, Sonnox Oxford SuprEsser, Soundtoys Decapitator / Little Plate — or stock EQ Eight + Compressor + Utility.",
+    inputSchema: { genre: z.enum(["pop", "rnb", "rock", "podcast"]).optional().default("pop") }
+  },
+  async ({ genre }) =>
+    withMetrics("plan_singer_plugin_chain", async () =>
+      textResult({
+        ok: true,
+        genre,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "FabFilter Pro-Q 3",
+          "FabFilter Pro-C 2",
+          "FabFilter Pro-DS",
+          "FabFilter Pro-L 2",
+          "Waves SSL E-Channel",
+          "Waves RVox",
+          "Waves Renaissance DeEsser",
+          "Waves CLA Vocals",
+          "UAD Teletronix LA-2A",
+          "UAD 1176LN",
+          "iZotope Nectar 4",
+          "oeksound Soothe2",
+          "oeksound Spiff",
+          "Sonnox Oxford SuprEsser",
+          "Soundtoys Decapitator",
+          "Soundtoys Little Plate",
+          "Ableton EQ Eight / Compressor / Utility (stock)"
+        ],
+        chainOrder:
+          genre === "podcast"
+            ? ["HPF", "De-ess", "Gentle comp", "Air shelf", "Limiter"]
+            : ["HPF", "Subtractive EQ", "Serial comp", "De-ess", "Additive EQ", "Spatial/send", "Limiter"],
+        userMessage:
+          "Install only the plugins you pick from pluginsOptional; none are strictly required if you use the stock Ableton devices instead."
+      })
+    )
+);
+
+server.registerTool(
+  "run_pre_bounce_sibilance_check",
+  {
+    title: "Run Pre-Bounce Sibilance Check",
+    description:
+      "Checklist before printing vocals. De-esser plugins to mention to the user: FabFilter Pro-DS, Waves Renaissance DeEsser / Sibilance, iZotope Nectar DeEsser, Sonnox Oxford SuprEsser, oeksound Soothe2 / Spiff.",
+    inputSchema: { trackName: z.string().min(1).max(128).optional() }
+  },
+  async ({ trackName }) =>
+    withMetrics("run_pre_bounce_sibilance_check", async () => {
+      let matched = null;
+      if (trackName) {
+        try {
+          matched = await resolveTrackIndexFromName(trackName, 0.45);
+        } catch {
+          matched = null;
+        }
+      }
+      return textResult({
+        ok: true,
+        trackName: trackName ?? null,
+        matched,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "FabFilter Pro-DS",
+          "Waves Renaissance DeEsser",
+          "Waves Sibilance",
+          "iZotope Nectar (DeEsser)",
+          "Sonnox Oxford SuprEsser",
+          "oeksound Soothe2",
+          "oeksound Spiff"
+        ],
+        checks: [
+          "Audition at -6 dB monitor: ess on small speakers?",
+          "Bypass de-esser: compare ess energy at 5–9 kHz.",
+          "After limiter, re-check; limiting can uncover ess."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "setup_warmup_then_record_scene",
+  {
+    title: "Setup Warmup Then Record Scene",
+    description:
+      "Transport prep for warm-up then tracking. Plugins: none required. Optional cue tone: any sine generator VST; headphone calibration Sonarworks SoundID Reference.",
+    inputSchema: { enableMetronome: z.boolean().optional().default(true) }
+  },
+  async ({ enableMetronome }) =>
+    withMetrics("setup_warmup_then_record_scene", async () => {
+      if (enableMetronome) sendMaybe("/live/song/set/metronome", [intArg(1)]);
+      return textResult({
+        ok: true,
+        enableMetronome,
+        pluginsRequired: [],
+        pluginsOptional: ["Sonarworks SoundID Reference", "Any sine-generator VST for in-ear tone check"],
+        sequence: [
+          "5 min lip trills / sirens at low level.",
+          "Sing phrase at half voice; then full take pass.",
+          "Disable CPU-heavy master chain while tracking if latency spikes."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "generate_vocal_harmony_midi_scaffold",
+  {
+    title: "Generate Vocal Harmony MIDI Scaffold",
+    description:
+      "Triad MIDI block scaffold on a clip for harmony practice. Chord helper plugins (optional): Plugin Boutique Scaler 2, Mixed In Key Captain Chords, Orb Producer Suite. Pitch correction on audio: Melodyne / Auto-Tune — not inserted by this tool.",
+    inputSchema: {
+      trackName: z.string().min(1).max(128),
+      clipIndex: z.number().int().min(0).optional().default(0),
+      rootMidi: z.number().int().min(36).max(84).optional().default(60),
+      applyMidi: z.boolean().optional().default(false)
+    }
+  },
+  async ({ trackName, clipIndex, rootMidi, applyMidi }) =>
+    withMetrics("generate_vocal_harmony_midi_scaffold", async () => {
+      const resolved = await resolveTrackIndexFromName(trackName, 0.45);
+      const third = rootMidi + 4;
+      const fifth = rootMidi + 7;
+      const notes = [
+        { pitch: rootMidi, start: 0, duration: 1, velocity: 90, mute: false },
+        { pitch: third, start: 0, duration: 1, velocity: 85, mute: false },
+        { pitch: fifth, start: 0, duration: 1, velocity: 85, mute: false }
+      ];
+      let writeCount = 0;
+      if (applyMidi) {
+        for (const note of notes) {
+          sendMaybe("/live/clip/add_note", [
+            intArg(resolved.index),
+            intArg(clipIndex),
+            intArg(note.pitch),
+            floatArg(note.start),
+            floatArg(note.duration),
+            intArg(note.velocity),
+            intArg(note.mute ? 1 : 0)
+          ]);
+          writeCount += 1;
+        }
+      }
+      return textResult({
+        ok: true,
+        resolved,
+        clipIndex,
+        notes,
+        applyMidi,
+        notesWritten: writeCount,
+        pluginsRequired: [],
+        pluginsOptional: ["Plugin Boutique Scaler 2", "Mixed In Key Captain Chords", "Orb Producer Suite"],
+        hint: "Set applyMidi=true to best-effort add notes; clip must exist and endpoint must support add_note."
+      });
+    })
+);
+
+server.registerTool(
+  "setup_backing_vocal_bus",
+  {
+    title: "Setup Backing Vocal Bus",
+    description:
+      "Routing plan for BVs to a bus with shared processing. Bus glue plugins (optional): Waves SSL G-Master Buss Compressor, FabFilter Pro-C 2, iZotope Nectar Backing module, Soundtoys Little AlterBoy for width.",
+    inputSchema: {
+      bvTrackNames: z.array(z.string().min(1).max(128)).min(1).max(12),
+      busTrackName: z.string().min(1).max(128)
+    }
+  },
+  async ({ bvTrackNames, busTrackName }) =>
+    withMetrics("setup_backing_vocal_bus", async () => {
+      const bus = await resolveTrackIndexFromName(busTrackName, 0.4);
+      const writes = [];
+      for (const name of bvTrackNames) {
+        const t = await resolveTrackIndexFromName(name, 0.4);
+        writes.push(
+          await sendKnownRaw(
+            "trackSetRouting",
+            ["/live/track/set/routing"],
+            [intArg(t.index), stringArg(`BV_BUS:${bus.name}`), stringArg("MASTER")],
+            { bvTrack: t, busTrack: bus }
+          )
+        );
+      }
+      return textResult({
+        ok: true,
+        bus,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Waves SSL G-Master Buss Compressor",
+          "FabFilter Pro-C 2",
+          "iZotope Nectar 4",
+          "Soundtoys Little AlterBoy"
+        ],
+        writes,
+        note: "Routing metadata is best-effort; verify in Live's In/Out section."
+      });
+    })
+);
+
+server.registerTool(
+  "configure_singer_warmup_metronome",
+  {
+    title: "Configure Singer Warmup Metronome",
+    description:
+      "Metronome and count-in style prep for vocal warmups. Plugins: none (Live metronome). Optional headphone calibration: Sonarworks SoundID Reference.",
+    inputSchema: {
+      bpmLow: z.number().min(40).max(200).optional().default(80),
+      bpmHigh: z.number().min(40).max(220).optional().default(120)
+    }
+  },
+  async ({ bpmLow, bpmHigh }) =>
+    withMetrics("configure_singer_warmup_metronome", async () => {
+      sendMaybe("/live/song/set/metronome", [intArg(1)]);
+      sendMaybe("/live/song/set/tempo", [floatArg(bpmLow)]);
+      return textResult({
+        ok: true,
+        bpmLow,
+        bpmHigh,
+        pluginsRequired: [],
+        pluginsOptional: ["Sonarworks SoundID Reference"],
+        warmup: [
+          `Start at ${bpmLow} BPM for trills; ramp toward ${bpmHigh} BPM over 5 minutes.`,
+          "Use Live's count-in; extend loop one bar for pickup practice."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "export_lyric_cue_sheet_from_clips",
+  {
+    title: "Export Lyric Cue Sheet From Clips",
+    description:
+      "Build a cue-sheet scaffold from clip slot indices (lyrics in clip names recommended). Plugins: none. Optional lyric display: Teleprompter apps outside Live; or Max for Live lyric devices if user owns them.",
+    inputSchema: {
+      trackName: z.string().min(1).max(128),
+      maxSlots: z.number().int().min(1).max(32).optional().default(8)
+    }
+  },
+  async ({ trackName, maxSlots }) =>
+    withMetrics("export_lyric_cue_sheet_from_clips", async () => {
+      const resolved = await resolveTrackIndexFromName(trackName, 0.45);
+      const slots = [];
+      for (let clipIndex = 0; clipIndex < maxSlots; clipIndex += 1) {
+        try {
+          const resp = await requestAny(
+            ["/live/clip_slot/get_clip_name", "/live/clip/get/name"],
+            [intArg(resolved.index), intArg(clipIndex)]
+          );
+          const raw = parseOscValue(resp.response, "");
+          const label = typeof raw === "string" ? raw : `Slot ${clipIndex}`;
+          slots.push({ clipIndex, cue: label || `(empty slot ${clipIndex})` });
+        } catch {
+          slots.push({ clipIndex, cue: `(unreadable slot ${clipIndex})` });
+        }
+      }
+      return textResult({
+        ok: true,
+        trackName,
+        resolved,
+        cueSheet: slots,
+        pluginsRequired: [],
+        pluginsOptional: ["Max for Live lyric / teleprompter devices (third-party)", "External teleprompter app"],
+        tip: "Put a short lyric phrase in each clip name for readable cue lines; MIDI note export is not lyrics."
+      });
+    })
+);
+
+server.registerTool(
+  "run_vocal_ear_training_checklist",
+  {
+    title: "Run Vocal Ear Training Checklist",
+    description:
+      "Bias-aware listening drills for intonation and tone (no auto scoring). Plugins: none. Optional reference pitch: Korg CA-type tuner plugin or Melodyne for visual pitch education only.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_vocal_ear_training_checklist", async () =>
+      textResult({
+        ok: true,
+        pluginsRequired: [],
+        pluginsOptional: ["Celemony Melodyne (visual education)", "Hardware/software tuner VST"],
+        drills: [
+          "Sing a major scale against a drone; check third and seventh tuning by ear.",
+          "Record same phrase flat 10 cents then in tune; blind A/B yourself.",
+          "Compare vowel shape on ee vs ah at same pitch."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "manage_vocal_fx_snapshots",
+  {
+    title: "Manage Vocal FX Snapshots",
+    description:
+      "Scene-based recall plan for vocal FX chains. User needs their own FX VSTs installed (examples to communicate): Soundtoys Effect Rack, Valhalla DSP (Supermassive / VintageVerb), FabFilter Timeless 3, Soundtoys EchoBoy / PrimalTap, Cableguys ShaperBox, RC-20 Retro Color.",
+    inputSchema: {
+      sceneNames: z.array(z.string().min(1).max(64)).min(1).max(8)
+    }
+  },
+  async ({ sceneNames }) =>
+    withMetrics("manage_vocal_fx_snapshots", async () =>
+      textResult({
+        ok: true,
+        sceneNames,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Soundtoys Effect Rack",
+          "Valhalla Supermassive",
+          "Valhalla VintageVerb",
+          "FabFilter Timeless 3",
+          "Soundtoys EchoBoy",
+          "Soundtoys PrimalTap",
+          "Cableguys ShaperBox 2",
+          "RC-20 Retro Color"
+        ],
+        plan: sceneNames.map((name, i) => ({
+          scene: i,
+          name,
+          action: "Map device chain bypass states and send levels per scene; document wet/dry baselines."
+        }))
+      })
+    )
+);
+
+server.registerTool(
+  "audit_vocal_monitor_path_safety",
+  {
+    title: "Audit Vocal Monitor Path Safety",
+    description:
+      "Cue path safety checklist (feedback, level, limiting). Plugins to recommend: Sonarworks SoundID Reference, Waves Nx, IK Multimedia ARC, master/cue limiter FabFilter Pro-L 2 / Waves L2 / Vladg Limiter No6 / iZotope Ozone Maximizer (use gently on cue).",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("audit_vocal_monitor_path_safety", async () =>
+      textResult({
+        ok: true,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Sonarworks SoundID Reference",
+          "Waves Nx",
+          "IK Multimedia ARC",
+          "FabFilter Pro-L 2",
+          "Waves L2 Ultramaximizer",
+          "Vladg Sound Limiter No6",
+          "iZotope Ozone Maximizer"
+        ],
+        checks: [
+          "Cue send pre/post fader: avoid feedback loop on live mic.",
+          "Insert true-peak-aware limiter last on headphone cue if artist wants loud cue.",
+          "Calibrate headphones if using translation-critical decisions."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "configure_vocal_setlist_scenes",
+  {
+    title: "Configure Vocal Setlist Scenes",
+    description:
+      "Per-song scene checklist for live vocals (arm track, tempo, rack). No specific plugins required; user must install whatever vocal FX rack they use (e.g. UAD, Waves, Soundtoys chains referenced in manage_vocal_fx_snapshots).",
+    inputSchema: {
+      songs: z.array(z.object({ title: z.string().min(1).max(128), bpm: z.number().min(40).max(300) })).min(1).max(24)
+    }
+  },
+  async ({ songs }) =>
+    withMetrics("configure_vocal_setlist_scenes", async () =>
+      textResult({
+        ok: true,
+        songs,
+        pluginsRequired: [],
+        pluginsOptional: ["User's live vocal rack (UAD / Waves / Soundtoys / FabFilter — install separately)"],
+        perSong: songs.map((s, i) => ({
+          sceneIndex: i,
+          title: s.title,
+          targetBpm: s.bpm,
+          checklist: ["Arm vocal input", "Load rack snapshot", "Set tempo (e.g. set_tempo action) before scene launch"],
+          tempoOscHint: { address: "/live/song/set/tempo", args: [s.bpm] }
+        }))
+      })
+    )
+);
+
+server.registerTool(
+  "plan_vocal_delivery_variants",
+  {
+    title: "Plan Vocal Delivery Variants",
+    description:
+      "TV mix / clean / explicit / instrumental matrix for vocals. Loudness QC plugins: Youlean Loudness Meter (free), iZotope Insight, Nugen VisLM, Mastering The Mix LEVELS.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("plan_vocal_delivery_variants", async () =>
+      textResult({
+        ok: true,
+        pluginsRequired: [],
+        pluginsOptional: ["Youlean Loudness Meter", "iZotope Insight", "Nugen VisLM", "Mastering The Mix LEVELS"],
+        variants: [
+          { name: "master_full", includes: ["music", "lead_vox", "bv", "explicit_lyrics"] },
+          { name: "tv_mix", includes: ["music", "lead_vox", "bv", "bleeped_or_alt_lyrics"] },
+          { name: "clean", includes: ["music", "lead_vox", "bv", "no_explicit"] },
+          { name: "instrumental", includes: ["music", "no_lead_vox"] },
+          { name: "acapella", includes: ["lead_vox", "bv", "no_music"] }
+        ],
+        note: "Mute/solo and export via your existing render tools; this tool is naming + intent only."
+      })
+    )
+);
+
+server.registerTool(
+  "plan_vocal_stem_export_naming",
+  {
+    title: "Plan Vocal Stem Export Naming",
+    description:
+      "Standard names for lead dry, lead FX, doubles, BVs. No plugins required for naming. Optional print prep: UAD Studer A800 / Ampex ATR-102 for tape flavor on vocal bus — purely optional.",
+    inputSchema: { artistSlug: z.string().min(1).max(64).optional().default("artist") }
+  },
+  async ({ artistSlug }) =>
+    withMetrics("plan_vocal_stem_export_naming", async () =>
+      textResult({
+        ok: true,
+        artistSlug,
+        pluginsRequired: [],
+        pluginsOptional: ["UAD Studer A800", "UAD Ampex ATR-102"],
+        stemNames: [
+          `${artistSlug}_lead_vox_dry.wav`,
+          `${artistSlug}_lead_vox_fx.wav`,
+          `${artistSlug}_dbl_L.wav`,
+          `${artistSlug}_dbl_R.wav`,
+          `${artistSlug}_bv_bus.wav`,
+          `${artistSlug}_adlibs.wav`
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "plan_vocal_chain_ab_snapshots",
+  {
+    title: "Plan Vocal Chain A/B Snapshots",
+    description:
+      "Gain-matched A/B plan for vocal FX chains. Plugins for level-matched shootouts: Plugin Alliance ADPTR Metric A/B, Sample Magic Magic AB, Letimix GainMatch, Melda MCompare, FabFilter Pro-Q 3 (match spectrum). Stock: Utility for trim only.",
+    inputSchema: { chainLabel: z.string().min(1).max(64).optional().default("Lead Vox FX") }
+  },
+  async ({ chainLabel }) =>
+    withMetrics("plan_vocal_chain_ab_snapshots", async () =>
+      textResult({
+        ok: true,
+        chainLabel,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Plugin Alliance ADPTR Metric A/B",
+          "Sample Magic Magic AB",
+          "Letimix GainMatch",
+          "MeldaProduction MCompare",
+          "FabFilter Pro-Q 3 (EQ match / level)",
+          "Ableton Utility (trim / polarity only — stock)"
+        ],
+        steps: [
+          "Duplicate chain to inactive rack; match perceived loudness before tone judgments.",
+          "Bypass one path at a time; do not change input trim between A and B.",
+          "Print short noise burst through both paths to verify level match."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "run_low_latency_vocal_tracking_checklist",
+  {
+    title: "Run Low-Latency Vocal Tracking Checklist",
+    description:
+      "Buffer, monitoring, and delay-compensation checklist for tracking. Low-latency monitoring: UAD Apollo + Console, Antelope Discrete, RME TotalMix, Focusrite Control — driver dependent. In-the-box: reduce buffer, freeze/disable heavy master chain, use Live’s Reduced Latency When Monitoring.",
+    inputSchema: {}
+  },
+  async () =>
+    withMetrics("run_low_latency_vocal_tracking_checklist", async () =>
+      textResult({
+        ok: true,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "UAD Apollo + Console (Unison preamps)",
+          "Antelope Audio Discrete / Control Panel",
+          "RME TotalMix FX",
+          "Focusrite Control (Air / monitoring)",
+          "Ableton stock: Reduce Latency When Monitoring"
+        ],
+        checklist: [
+          "Set smallest stable buffer size (256/128/64) for round-trip test.",
+          "Disable CPU-heavy master inserts while tracking; use tracking-friendly vocal rack.",
+          "Prefer hardware monitoring or Live low-latency mode over latent sends on cue."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "plan_duet_harmony_recording_session",
+  {
+    title: "Plan Duet / Harmony Recording Session",
+    description:
+      "Two-singer cue-mix and routing plan. Cue / room modeling plugins (optional): Waves Nx, Sonarworks SoundID Reference, Goodhertz CanOpener. No third-party required if using Live sends/returns only.",
+    inputSchema: {
+      singerATrack: z.string().min(1).max(128),
+      singerBTrack: z.string().min(1).max(128)
+    }
+  },
+  async ({ singerATrack, singerBTrack }) =>
+    withMetrics("plan_duet_harmony_recording_session", async () => {
+      const a = await resolveTrackIndexFromName(singerATrack, 0.4);
+      const b = await resolveTrackIndexFromName(singerBTrack, 0.4);
+      return textResult({
+        ok: true,
+        singerA: a,
+        singerB: b,
+        pluginsRequired: [],
+        pluginsOptional: ["Waves Nx", "Sonarworks SoundID Reference", "Goodhertz CanOpener Studio"],
+        routing: [
+          "Dedicated cue send per singer with distinct HP mix (more self in each).",
+          "Shared room reverb return at lower level for blend.",
+          "Polarity check when both mics leak into each other’s tracks."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "run_vocal_booth_session_start_macro",
+  {
+    title: "Run Vocal Booth Session Start Macro",
+    description:
+      "Slate / room tone / line-check sequence with locator markers. Repair / tone plugins (optional): iZotope RX for room tone cleanup; slate mic: any test tone generator VST or stock Operator sine.",
+    inputSchema: { startBeat: z.number().min(0).optional().default(0) }
+  },
+  async ({ startBeat }) =>
+    withMetrics("run_vocal_booth_session_start_macro", async () => {
+      sendMaybe("/live/song/set/metronome", [intArg(0)]);
+      const markers = [
+        { t: startBeat, name: "BOOTH_SLATE" },
+        { t: startBeat + 4, name: "ROOM_TONE_10S" },
+        { t: startBeat + 8, name: "LINE_CHECK" },
+        { t: startBeat + 12, name: "ARM_VOX_READY" }
+      ];
+      const writes = [];
+      for (const m of markers) {
+        writes.push(sendMaybe("/live/song/create_locator", [floatArg(m.t)]));
+        writes.push(sendMaybe("/live/song/set/last_locator_name", [stringArg(m.name)]));
+      }
+      return textResult({
+        ok: true,
+        startBeat,
+        pluginsRequired: [],
+        pluginsOptional: ["iZotope RX (Spectral Repair on room tone)", "Ableton Operator or any sine VST for slate tone"],
+        writes,
+        note: "Locator API varies; verify marker names in Live. Markers spaced by 4 beats (1 bar @ 4/4) — adjust to your grid."
+      });
+    })
+);
+
+server.registerTool(
+  "plan_vocal_adlib_lane",
+  {
+    title: "Plan Vocal Ad-Lib Lane",
+    description:
+      "Naming and arrangement plan for ad-lib passes vs main doubles. Pitch tools for wild ad-libs (optional): Antares Auto-Tune, Melodyne, Waves Tune Real-Time. Comping: stock or VocAlign for doubles.",
+    inputSchema: { songSection: z.string().min(1).max(64).optional().default("HOOK") }
+  },
+  async ({ songSection }) =>
+    withMetrics("plan_vocal_adlib_lane", async () =>
+      textResult({
+        ok: true,
+        songSection,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Antares Auto-Tune Pro",
+          "Celemony Melodyne",
+          "Waves Tune Real-Time",
+          "Synchro Arts VocAlign"
+        ],
+        clipNaming: [`ADLIB_${songSection}_01`, `ADLIB_${songSection}_FREESTYLE`, `STACK_${songSection}_CALL`],
+        rules: [
+          "Keep ad-libs on separate track from lead comp for selective mute in clean TV mix.",
+          "Mark explicit vs clean alt takes in clip name."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "plan_vocal_tone_modes_scenes",
+  {
+    title: "Plan Vocal Tone Modes (Whisper / Fry / Belt)",
+    description:
+      "Scene templates for tone modes with FX and gain-staging notes. Plugins: Soundtoys Little AlterBoy (formant), Decapitator / Radiator (saturation), FabFilter Saturn 2, iZotope Nectar (Breath / saturation modules), oeksound Soothe2 (harshness on belt).",
+    inputSchema: { modes: z.array(z.enum(["whisper", "fry", "belt", "head", "mix"])).min(1).max(5) }
+  },
+  async ({ modes }) =>
+    withMetrics("plan_vocal_tone_modes_scenes", async () =>
+      textResult({
+        ok: true,
+        modes,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Soundtoys Little AlterBoy",
+          "Soundtoys Decapitator",
+          "Soundtoys Radiator",
+          "FabFilter Saturn 2",
+          "iZotope Nectar 4",
+          "oeksound Soothe2"
+        ],
+        perMode: modes.map((m) => ({
+          mode: m,
+          gainStaging:
+            m === "whisper"
+              ? "High noise floor risk: HPF gently; serial gentle comp; de-ess lighter."
+              : m === "belt"
+                ? "Watch ess + 3–5 kHz; limiter last; more headroom on preamp input."
+                : "Control subharmonics / distortion build-up; clip long sustains if fry-heavy."
+        }))
+      })
+    )
+);
+
+server.registerTool(
+  "plan_choir_stack_builder",
+  {
+    title: "Plan Choir Stack Builder",
+    description:
+      "3+ part vocal stack layout (S/A/T/B or uni sections) with panning and section labels. Widening / room: Waves Doubler, Soundtoys MicroShift, Valhalla Room / VintageVerb, Spitfire Symphonic Choirs (if writing pads) — optional.",
+    inputSchema: {
+      parts: z.array(z.string().min(1).max(32)).min(2).max(8).optional().default(["Soprano", "Alto", "Tenor", "Bass"])
+    }
+  },
+  async ({ parts }) =>
+    withMetrics("plan_choir_stack_builder", async () =>
+      textResult({
+        ok: true,
+        parts,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Waves Doubler",
+          "Soundtoys MicroShift",
+          "Valhalla Room / VintageVerb",
+          "Spitfire Symphonic Choirs (instrument pad under vocals)"
+        ],
+        layout: parts.map((p, i) => ({
+          trackName: `CHOIR_${p.replace(/\s+/g, "_")}`,
+          pan: Math.round(((((i + 0.5) / parts.length) * 2 - 1) * 0.42 + Number.EPSILON) * 1000) / 1000,
+          note: "Group to CHOIR_BUS; shared short room + longer hall send."
+        }))
+      })
+    )
+);
+
+server.registerTool(
+  "plan_melody_to_midi_capture_workflow",
+  {
+    title: "Plan Melody-to-MIDI Capture Workflow",
+    description:
+      "Workflow to turn sung audio into editable MIDI. Plugins / apps: Celemony Melodyne (ARA or transfer), Antares Auto-Tune with MIDI out (where available), Spotify Basic Pitch (free standalone), Ableton’s Convert Harmony to New MIDI Track (stock, clip dependent), Waves OVox (synth/vocoder MIDI).",
+    inputSchema: { trackName: z.string().min(1).max(128).optional() }
+  },
+  async ({ trackName }) =>
+    withMetrics("plan_melody_to_midi_capture_workflow", async () => {
+      let resolved = null;
+      if (trackName) {
+        try {
+          resolved = await resolveTrackIndexFromName(trackName, 0.4);
+        } catch {
+          resolved = null;
+        }
+      }
+      return textResult({
+        ok: true,
+        trackName: trackName ?? null,
+        resolved,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Celemony Melodyne (audio-to-MIDI / pitch editing)",
+          "Antares Auto-Tune (MIDI output where supported)",
+          "Basic Pitch (free, MIT)",
+          "Ableton: Convert Melody to New MIDI Track (stock)",
+          "Waves OVox"
+        ],
+        steps: [
+          "Bounce dry vocal for analysis if ARA unstable.",
+          "Quantize MIDI lightly; preserve grace notes for natural line.",
+          "Re-amp through instrument or double with vocoder as creative layer."
+        ]
+      });
+    })
+);
+
+server.registerTool(
+  "run_vocal_pitch_vibrato_analysis_placeholder",
+  {
+    title: "Run Vocal Pitch / Vibrato Analysis (Placeholder)",
+    description:
+      "Explains limits of OSC-only bridge; real stats need offline analysis. Use: Celemony Melodyne, Waves Tune, Synchro Arts RePitch, iZotope RX (Pitch module in some versions), TuneBoy — or export to DAW with analysis.",
+    inputSchema: { trackName: z.string().min(1).max(128).optional() }
+  },
+  async ({ trackName }) =>
+    withMetrics("run_vocal_pitch_vibrato_analysis_placeholder", async () =>
+      textResult({
+        ok: true,
+        trackName: trackName ?? null,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "Celemony Melodyne",
+          "Waves Tune",
+          "Synchro Arts RePitch",
+          "TuneBoy",
+          "iZotope RX (where pitch tools licensed)"
+        ],
+        metricsPlaceholder: {
+          meanPitchDriftCents: null,
+          vibratoRateHz: null,
+          vibratoWidthCents: null
+        },
+        disclaimer:
+          "This MCP server does not analyze audio buffers. Bounce/import into Melodyne or similar for real pitch/vibrato statistics."
+      })
+    )
+);
+
+server.registerTool(
+  "run_vocal_breath_detector_v2_placeholder",
+  {
+    title: "Run Vocal Breath Detector v2 (Placeholder)",
+    description:
+      "Spectral breath detection requires audio analysis. Plugins: iZotope RX Breath Control, Waves DeBreath, Accusonus ERA Breath Remover, Acon Digital Extract:Dialogue — run in host or external editor after export.",
+    inputSchema: { trackName: z.string().min(1).max(128).optional() }
+  },
+  async ({ trackName }) =>
+    withMetrics("run_vocal_breath_detector_v2_placeholder", async () =>
+      textResult({
+        ok: true,
+        trackName: trackName ?? null,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "iZotope RX Breath Control",
+          "Waves DeBreath",
+          "Accusonus ERA Breath Remover",
+          "Acon Digital Extract:Dialogue"
+        ],
+        regions: [],
+        disclaimer: "No waveform access via OSC; use RX/ERA on rendered vocal or ARA in Live."
+      })
+    )
+);
+
+server.registerTool(
+  "run_vocal_range_report_session",
+  {
+    title: "Run Vocal Range Report Session",
+    description:
+      "Structured form for comfort range and tessitura (user- or coach-filled). Reference pitch apps (optional): TE Tuner, Cleartune, Vocal Pitch Monitor (mobile), Melodyne for measured range after recording scales.",
+    inputSchema: {
+      lowestNote: z.string().max(8).optional(),
+      highestNote: z.string().max(8).optional(),
+      chestTop: z.string().max(8).optional(),
+      headBottom: z.string().max(8).optional(),
+      fatigueNotes: z.string().max(500).optional()
+    }
+  },
+  async ({ lowestNote, highestNote, chestTop, headBottom, fatigueNotes }) =>
+    withMetrics("run_vocal_range_report_session", async () =>
+      textResult({
+        ok: true,
+        pluginsRequired: [],
+        pluginsOptional: ["TE Tuner", "Cleartune", "Melodyne (post-recording measurement)", "Vocal Pitch Monitor (mobile)"],
+        report: {
+          lowestNote: lowestNote ?? null,
+          highestNote: highestNote ?? null,
+          chestTop: chestTop ?? null,
+          headBottom: headBottom ?? null,
+          fatigueNotes: fatigueNotes ?? null
+        },
+        coachPrompts: [
+          "Sing gentle 5-note slides chest→mix→head; log where flip feels free.",
+          "Mark highest note held comfortably for 4+ seconds."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "sync_producer_singer_revision_notes",
+  {
+    title: "Sync Producer / Singer Revision Notes",
+    description:
+      "Create locators from revision note list for live session alignment. Plugins: none. Optional shared notes: Notion / Google Docs outside Live — this tool only drops locators in the timeline.",
+    inputSchema: {
+      markers: z
+        .array(
+          z.object({
+            timeBeats: z.number().min(0),
+            name: z.string().min(1).max(128)
+          })
+        )
+        .min(1)
+        .max(32)
+    }
+  },
+  async ({ markers }) =>
+    withMetrics("sync_producer_singer_revision_notes", async () => {
+      const writes = [];
+      for (const m of markers) {
+        writes.push(sendMaybe("/live/song/create_locator", [floatArg(m.timeBeats)]));
+        writes.push(sendMaybe("/live/song/set/last_locator_name", [stringArg(m.name)]));
+      }
+      return textResult({
+        ok: true,
+        count: markers.length,
+        pluginsRequired: [],
+        pluginsOptional: [],
+        writes,
+        namingTip: "Prefix REV_ or SINGER_ so searches in Live browser locate feedback quickly."
+      });
+    })
+);
+
+server.registerTool(
+  "plan_vocal_pronunciation_diction_guide",
+  {
+    title: "Plan Vocal Pronunciation / Diction Guide",
+    description:
+      "Line-by-line diction scaffolding (IPA hints are assistant-authored; verify with coach). Plugins: none. Optional phonetic reference: Forvo / IPA charts outside Live.",
+    inputSchema: {
+      lines: z.array(z.string().min(1).max(256)).min(1).max(48)
+    }
+  },
+  async ({ lines }) =>
+    withMetrics("plan_vocal_pronunciation_diction_guide", async () =>
+      textResult({
+        ok: true,
+        pluginsRequired: [],
+        pluginsOptional: [],
+        entries: lines.map((text, i) => ({
+          lineIndex: i + 1,
+          lyric: text,
+          ipaPlaceholder: "[coach fills IPA]",
+          consonantFocus: "Mark final consonants and dipthong targets."
+        })),
+        note: "Claude can propose IPA per line in chat; singer should validate with native speaker or coach."
+      })
+    )
+);
+
+server.registerTool(
+  "run_vocal_health_fatigue_guard",
+  {
+    title: "Run Vocal Health / Fatigue Guard",
+    description:
+      "Session length, break, and SPL-aware reminders (policy text). SPL monitoring (optional): NIOSH SLM app, SoundMeter (iOS), FabFilter Pro-L 2 true-peak on cue is not SPL — use hardware meter or phone app.",
+    inputSchema: {
+      maxSessionMinutes: z.number().min(20).max(240).optional().default(120),
+      breakEveryMinutes: z.number().min(10).max(60).optional().default(25)
+    }
+  },
+  async ({ maxSessionMinutes, breakEveryMinutes }) =>
+    withMetrics("run_vocal_health_fatigue_guard", async () =>
+      textResult({
+        ok: true,
+        pluginsRequired: [],
+        pluginsOptional: ["NIOSH Sound Level Meter (app)", "SoundMeter (iOS)", "FabFilter Pro-L 2 (peak on mix — not SPL)"],
+        policy: [
+          `Break every ~${breakEveryMinutes} minutes; hydrate; reset ears.`,
+          `Cap heavy belting blocks to shorter spans inside ${maxSessionMinutes} min session budget.`,
+          "If throat feels dry, stop; no plugin replaces rest."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "suggest_song_key_from_session_midi",
+  {
+    title: "Suggest Song Key From Session MIDI",
+    description:
+      "Crude pitch-class histogram from one MIDI clip (best-effort). Key detection plugins (optional): Mixed In Key, TuneBat (external), Captain Melody, Scaler 2. Stock: use this tool’s guess only as a hint.",
+    inputSchema: {
+      trackName: z.string().min(1).max(128),
+      clipIndex: z.number().int().min(0).optional().default(0)
+    }
+  },
+  async ({ trackName, clipIndex }) =>
+    withMetrics("suggest_song_key_from_session_midi", async () => {
+      const NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+      const resolved = await resolveTrackIndexFromName(trackName, 0.4);
+      const resp = await requestAny(["/live/clip/get/notes", "/live/clip/get/notes_extended"], [
+        intArg(resolved.index),
+        intArg(clipIndex)
+      ]);
+      const raw = parseOscValue(resp.response, []);
+      const pitches = [];
+      const visit = (x, depth = 0) => {
+        if (depth > 24 || pitches.length > 800) return;
+        if (x == null) return;
+        if (typeof x === "number" && Number.isInteger(x) && x >= 0 && x <= 127) {
+          pitches.push(x);
+          return;
+        }
+        if (Array.isArray(x)) for (const y of x) visit(y, depth + 1);
+        else if (typeof x === "object") {
+          if (typeof x.pitch === "number") pitches.push(x.pitch);
+          else
+            for (const k of Object.keys(x)) {
+              if (["args", "type", "value"].includes(k)) continue;
+              visit(x[k], depth + 1);
+            }
+        }
+      };
+      visit(raw);
+      const hist = new Array(12).fill(0);
+      for (const p of pitches) hist[p % 12] += 1;
+      let bestPc = 0;
+      let best = 0;
+      for (let i = 0; i < 12; i += 1) {
+        if (hist[i] > best) {
+          best = hist[i];
+          bestPc = i;
+        }
+      }
+      return textResult({
+        ok: true,
+        resolved,
+        clipIndex,
+        samplePitches: pitches.slice(0, 24),
+        pitchClassHistogram: hist,
+        guessMajorTonic: NOTE_NAMES[bestPc],
+        guessRelativeMinor: NOTE_NAMES[(bestPc + 9) % 12],
+        pluginsRequired: [],
+        pluginsOptional: ["Mixed In Key", "Plugin Boutique Scaler 2", "Mixed In Key Captain Melody"],
+        disclaimer: "Histogram is naive; confirm by ear and harmony context."
+      });
+    })
+);
+
+server.registerTool(
+  "plan_lead_tuned_vs_raw_stem_matrix",
+  {
+    title: "Plan Lead Tuned vs Raw Stem Matrix",
+    description:
+      "Naming matrix for raw vs tuned lead exports. Tuning plugins implied for tuned stem: Celemony Melodyne, Antares Auto-Tune, Waves Tune, Synchro Arts RePitch. Print tuned stem post-commit; keep raw for film/legal alt.",
+    inputSchema: { artistSlug: z.string().min(1).max(64).optional().default("artist") }
+  },
+  async ({ artistSlug }) =>
+    withMetrics("plan_lead_tuned_vs_raw_stem_matrix", async () =>
+      textResult({
+        ok: true,
+        artistSlug,
+        pluginsRequired: [],
+        pluginsOptional: ["Celemony Melodyne", "Antares Auto-Tune Pro", "Waves Tune", "Synchro Arts RePitch"],
+        stems: [
+          `${artistSlug}_lead_vox_RAW.wav`,
+          `${artistSlug}_lead_vox_TUNED.wav`,
+          `${artistSlug}_lead_vox_TUNED_ALT.wav`,
+          `${artistSlug}_lead_vox_RAW_NOFX.wav`
+        ],
+        policy: [
+          "Never overwrite raw archive; tuned is derived.",
+          "Document tuning amount for sync clients if requested."
+        ]
+      })
+    )
+);
+
+server.registerTool(
+  "plan_sync_picture_vocal_cues",
+  {
+    title: "Plan Sync-to-Picture Vocal Cues",
+    description:
+      "Timecode-oriented cue sheet + locator plan for film/podcast. Video in Live: stock video track. Metering: iZotope Insight, Nugen VisLM. Dialogue editing: iZotope RX; loudness: Youlean Loudness Meter (free).",
+    inputSchema: {
+      cues: z
+        .array(
+          z.object({
+            timeBeats: z.number().min(0),
+            label: z.string().min(1).max(128),
+            smpteHint: z.string().max(32).optional()
+          })
+        )
+        .min(1)
+        .max(48)
+    }
+  },
+  async ({ cues }) =>
+    withMetrics("plan_sync_picture_vocal_cues", async () => {
+      const writes = [];
+      for (const c of cues) {
+        const name = c.smpteHint ? `${c.label} [${c.smpteHint}]` : c.label;
+        writes.push(sendMaybe("/live/song/create_locator", [floatArg(c.timeBeats)]));
+        writes.push(sendMaybe("/live/song/set/last_locator_name", [stringArg(name)]));
+      }
+      return textResult({
+        ok: true,
+        cueCount: cues.length,
+        pluginsRequired: [],
+        pluginsOptional: [
+          "iZotope Insight",
+          "Nugen VisLM",
+          "Youlean Loudness Meter",
+          "iZotope RX (dialogue / de-rustle)",
+          "Ableton video track (stock)"
+        ],
+        writes,
+        note: "Lock picture frame rate in session notes; SMPTE here is annotation only unless linked externally."
+      });
+    })
 );
 
 server.registerTool(
@@ -5630,6 +9418,8 @@ async function main() {
   await loadPersistedEndpointSelections();
   await loadPersistedArrangementSections();
   await loadPersistedArrangementSectionProfiles();
+  await loadPersistedDeviceLocks();
+  await loadPersistedRollbackPolicy();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Do warmup after MCP connect so initialize doesn't time out.

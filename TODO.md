@@ -156,3 +156,111 @@ This file tracks the full implementation roadmap requested for this project.
 - [x] Session goals mode scaffold
 - [x] Multi-song set manager scaffold
 - [x] Auto documentation export scaffold
+
+## Phase 13 - AI creative intelligence and QA
+
+- [x] AI arrangement rewrite scaffold
+- [x] Drum replacement assistant scaffold
+- [x] Kick-bass conflict resolver scaffold
+- [x] Advanced vocal polish scaffold
+- [x] Genre template transformer scaffold
+- [x] Section similarity detector scaffold
+- [x] Drop builder plan scaffold
+- [x] Dynamic bus automation scaffold
+- [x] Release readiness scoring scaffold
+- [x] Intelligent freeze manager scaffold
+- [x] Session focus mode scaffold
+- [x] Contextual coaching scaffold
+- [x] Recording take ranking scaffold
+- [x] Reference-aware tonal targeting scaffold
+- [x] Creative prompt scene scaffold
+- [x] Live performance cue engine scaffold
+- [x] Error recovery autopilot scaffold
+- [x] Multi-project memory scaffold
+- [x] Release variant generator scaffold
+- [x] Post-export QA scaffold
+
+## Phase 14 - Translation, revision packaging, and safety automation
+
+- [x] Stem naming normalizer scaffold
+- [x] Pre-release loudness targeter scaffold
+- [x] Arrangement gap finder scaffold
+- [x] Hook reinforcement scaffold
+- [x] Kick transient optimizer scaffold
+- [x] Bass mono compatibility checker scaffold
+- [x] Drum bus punch mode scaffold
+- [x] Vocal intelligibility scoring scaffold
+- [x] Scene energy curve planner scaffold
+- [x] Live emergency state restore scaffold
+- [x] Adaptive sidechain manager scaffold
+- [x] Automation conflict detector scaffold
+- [x] Device parameter lock mode scaffold
+- [x] Ear training prompt mode scaffold
+- [x] Session drift monitor scaffold
+- [x] Variant consistency audit scaffold
+- [x] Mix translation simulator scaffold
+- [x] Batch song operations scaffold
+- [x] Client revision packaging scaffold
+- [x] Auto rollback policy scaffold
+
+## Phase 15 - Sound engineering intelligence
+
+- [x] Gain staging autopilot scaffold
+- [x] Phase alignment assistant scaffold
+- [x] Masking analyzer scaffold
+- [x] Dynamic range manager scaffold
+- [x] Sibilance/harshness detector scaffold
+- [x] Low-end control suite scaffold
+- [x] Bus compression tuner scaffold
+- [x] Transient shaping assistant scaffold
+- [x] Stereo image optimizer scaffold
+- [x] Reverb/delay space manager scaffold
+- [x] Automation quality checker scaffold
+- [x] Reference match engine scaffold
+- [x] Master chain safety analyzer scaffold
+- [x] Mix translation diagnostics scaffold
+- [x] Stem quality auditor scaffold
+- [x] Clip gain optimizer scaffold
+- [x] Noise/floor checker scaffold
+- [x] Loudness workflow assistant scaffold
+- [x] Revision delta analyzer scaffold
+- [x] Engineering checklist mode scaffold
+- [x] Integrated loudness meter path planner
+- [x] True-peak / ISP guardrails scaffold
+- [x] Spectral balance fingerprint (heuristic) scaffold
+- [x] Masking map v2 (ranked conflicts) scaffold
+- [x] Solo-safe diagnostic mode + rollback snapshot hook
+- [x] Correlation / mono-sum monitor scaffold
+- [x] Multiband dynamics chain planner
+- [x] De-essing automation plan + vocal rider planner
+- [x] Parallel processing recipes scaffold
+- [x] Send/reverb economy + delay coherence tools
+- [x] Kick/bass phase lab + drum phase alignment pack
+- [x] Translation presets + headphone translation profile
+- [x] Master chain delta lock + stem loudness normalization plan
+- [x] Dynamic range report + client revision A/B pack
+- [x] Engineering session modes + change attribution log + blind A/B helper
+
+## Phase 16 - Singer / vocal workflows
+
+- [x] Vocal take ladder + punch-in session planner
+- [x] Breath/noise candidate map + room-tone / headphone checklist
+- [x] Vocal comp workflow v2 + take consistency (level proxy)
+- [x] Vocal tuning + timing tighten planners (plugin-aware)
+- [x] Vocal doubles stack + singer plugin chain planner
+- [x] Pre-bounce sibilance check + warmup-then-record + harmony MIDI scaffold
+- [x] Backing vocal bus + warmup metronome + lyric cue sheet export
+- [x] Ear-training checklist + vocal FX snapshot plan + monitor path audit
+- [x] Vocal setlist scenes + delivery variants + stem naming plan
+
+## Phase 17 - Singer / vocal extended
+
+- [x] Vocal chain A/B snapshot plan (gain-matched shootouts)
+- [x] Low-latency vocal tracking checklist
+- [x] Duet / harmony recording session planner
+- [x] Vocal booth session-start macro (locators)
+- [x] Ad-lib lane + tone modes + choir stack planners
+- [x] Melody-to-MIDI capture workflow + pitch/vibrato + breath placeholders
+- [x] Vocal range report + producer/singer revision locators
+- [x] Pronunciation guide + vocal health guard + key-from-MIDI hint
+- [x] Lead tuned vs raw stem matrix + sync-to-picture vocal cues
