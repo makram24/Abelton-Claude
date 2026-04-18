@@ -52,7 +52,6 @@ const metrics = {
   commandDurationsMs: {}
 };
 const snapshots = new Map();
-const pendingPlans = new Map();
 const exportProfiles = new Map([
   [
     "streaming",
@@ -421,6 +420,43 @@ function textResult(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
 
+/** Live LOM current_monitoring_state: 0 = In, 1 = Auto, 2 = Off */
+function monitoringModeToInt(mode) {
+  const m = String(mode ?? "auto").toLowerCase();
+  if (m === "in") return 0;
+  if (m === "auto") return 1;
+  if (m === "off") return 2;
+  return 1;
+}
+
+/** AbletonOSC clip_slot APIs write Session View clips, not Arrangement timeline clips. */
+function sessionClipPlacementHint(trackIndex, clipIndex) {
+  return {
+    abletonUi: {
+      view: "session",
+      summary:
+        "Clip was written to the Session View matrix (vertical slots per track), not the horizontal Arrangement timeline.",
+      howToSeeIt: [
+        "Press Tab or click the Session View switch (two overlapping rectangles) so you see the clip grid.",
+        `Look at track index ${trackIndex}, column / scene row for clip slot ${clipIndex} (top row is often slot 0).`
+      ],
+      clipIndexSemantics:
+        "clipIndex is the Session slot (scene row) for that track — it is not bar 1, 2, 3 on the Arrangement ruler.",
+      moveToArrangement:
+        "Drag the clip from Session into the Arrangement, or arm the track and MIDI-record into the timeline.",
+      drumRackSound:
+        "If Drum Rack pads are empty (Drop a Sample Here), load drum samples or you will hear nothing even when MIDI exists.",
+      monitoringForClipPlayback:
+        "If Monitor is In, Live only passes external MIDI input — Session MIDI clips are effectively silent. Set Auto (LOM 1) via set_track_monitoring_mode or prepare_midi_track_for_clip_playback.",
+      playbackChecklist: [
+        "Monitor = Auto (not In) on the MIDI track",
+        "Track not muted; Master up; Audio To = Main",
+        "Device chain has an instrument with content (Drum Rack + samples on pads)"
+      ]
+    }
+  };
+}
+
 function toBoolInt(value) {
   return intArg(value ? 1 : 0);
 }
@@ -734,171 +770,6 @@ function sendMaybe(address, args = [], metadata = {}, options = {}) {
 }
 
 server.registerTool(
-  "get_connection_info",
-  {
-    title: "Get OSC Connection Info",
-    description:
-      "Return current OSC host/port configuration for AbletonOSC bridge."
-  },
-  async () => ({
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(
-          {
-            host: config.ABLETON_OSC_HOST,
-            sendPort: config.ABLETON_OSC_SEND_PORT,
-            listenPort: config.ABLETON_OSC_LISTEN_PORT,
-            timeoutMs: config.ABLETON_OSC_TIMEOUT_MS,
-            dryRun: config.ABLETON_DRY_RUN,
-            requireDestructiveConfirm: config.ABLETON_REQUIRE_DESTRUCTIVE_CONFIRM,
-            destructiveConfirmToken: DESTRUCTIVE_CONFIRM_TOKEN,
-            endpointSelections: Object.fromEntries(endpointSelections),
-            runtimeContext,
-            policyMode: policyState.mode,
-            startupWarnings
-          },
-          null,
-          2
-        )
-      }
-    ]
-  })
-);
-
-server.registerTool(
-  "get_last_error",
-  {
-    title: "Get Last Error",
-    description: "Return last normalized error details seen by the bridge."
-  },
-  async () =>
-    textResult({
-      lastError: metrics.lastError
-        ? {
-            ...metrics.lastError,
-            errorCode: classifyError({ message: metrics.lastError.message })
-          }
-        : null
-    })
-);
-
-server.registerTool(
-  "get_protocol_diagnostics",
-  {
-    title: "Get Protocol Diagnostics",
-    description: "Return bind ports and last packet/RTT diagnostics."
-  },
-  async () =>
-    textResult({
-      host: config.ABLETON_OSC_HOST,
-      sendPort: config.ABLETON_OSC_SEND_PORT,
-      listenPort: config.ABLETON_OSC_LISTEN_PORT,
-      protocolDiagnostics
-    })
-);
-
-server.registerTool(
-  "get_ops_dashboard",
-  {
-    title: "Get Ops Dashboard",
-    description:
-      "Unified operational dashboard: health, diagnostics, capability profile, conflicts, recent events, and export jobs.",
-    inputSchema: {
-      includeProbeSummary: z.boolean().optional().default(false),
-      recentEventsLimit: z.number().int().min(1).max(50).optional().default(10),
-      recentJobsLimit: z.number().int().min(1).max(50).optional().default(10)
-    }
-  },
-  async ({ includeProbeSummary, recentEventsLimit, recentJobsLimit }) =>
-    withMetrics("get_ops_dashboard", async () => {
-      const capability = buildCapabilityProfile();
-      const recentEvents = (stateCache.eventStream ?? []).slice(-recentEventsLimit);
-      const recentJobs = [...exportJobs.values()]
-        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
-        .slice(0, recentJobsLimit);
-      return textResult({
-        status: "ok",
-        now: new Date().toISOString(),
-        connection: {
-          host: config.ABLETON_OSC_HOST,
-          sendPort: config.ABLETON_OSC_SEND_PORT,
-          listenPort: config.ABLETON_OSC_LISTEN_PORT,
-          connected: connectionState.connected
-        },
-        health: {
-          probeReady: probeSummary !== null,
-          startupWarnings,
-          metrics: {
-            totalCommands: metrics.totalCommands,
-            successfulCommands: metrics.successfulCommands,
-            failedCommands: metrics.failedCommands,
-            dryRunCommands: metrics.dryRunCommands,
-            lastError: metrics.lastError
-          }
-        },
-        protocolDiagnostics,
-        capabilityProfile: capability,
-        policy: {
-          policyState,
-          runtimeContext
-        },
-        conflicts: {
-          pending: stateCache.pendingConflicts ?? [],
-          cacheLastRefreshAt: stateCache.lastRefreshAt
-        },
-        subscriptions: {
-          channels: stateCache.channels ?? [],
-          recentEvents
-        },
-        exportJobs: {
-          total: exportJobs.size,
-          recentJobs
-        },
-        probeSummary: includeProbeSummary ? probeSummary : undefined
-      });
-    })
-);
-
-server.registerTool(
-  "get_ops_dashboard_compact",
-  {
-    title: "Get Ops Dashboard Compact",
-    description: "Compact status summary for quick operational checks."
-  },
-  async () =>
-    withMetrics("get_ops_dashboard_compact", async () => {
-      const capability = buildCapabilityProfile();
-      const recentJob = [...exportJobs.values()].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0] ?? null;
-      const recentEvent = (stateCache.eventStream ?? []).slice(-1)[0] ?? null;
-      const status = metrics.failedCommands > 0 || (stateCache.pendingConflicts ?? []).length > 0 ? "warning" : "ok";
-      return textResult({
-        status,
-        connected: connectionState.connected,
-        probeReady: probeSummary !== null,
-        profile: capability.profile,
-        totalCommands: metrics.totalCommands,
-        failedCommands: metrics.failedCommands,
-        lastErrorCode: metrics.lastError ? classifyError({ message: metrics.lastError.message }) : null,
-        pendingConflicts: stateCache.pendingConflicts ?? [],
-        channels: stateCache.channels ?? [],
-        lastRttMs: protocolDiagnostics.lastRttMs,
-        recentJob: recentJob
-          ? {
-              jobId: recentJob.jobId,
-              status: recentJob.status,
-              profileName: recentJob.profileName,
-              createdAt: recentJob.createdAt
-            }
-          : null,
-        recentEvent: recentEvent
-          ? { at: recentEvent.at, type: recentEvent.type, address: recentEvent.address ?? null }
-          : null
-      });
-    })
-);
-
-server.registerTool(
   "health_live_test",
   {
     title: "Health Live Test",
@@ -963,41 +834,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "set_safety_mode",
-  {
-    title: "Set Safety Mode",
-    description: "Apply policy presets: safe, studio, live-performance.",
-    inputSchema: {
-      mode: z.enum(["safe", "studio", "live-performance"])
-    }
-  },
-  async ({ mode }) =>
-    withMetrics("set_safety_mode", async () => {
-      if (mode === "safe") {
-        policyState.mode = "safe";
-        policyState.blockDestructiveDuringPlayback = true;
-        policyState.requireRoleForDestructive = true;
-        runtimeContext.role = "operator";
-        runtimeContext.performanceMode = false;
-      } else if (mode === "studio") {
-        policyState.mode = "studio";
-        policyState.blockDestructiveDuringPlayback = true;
-        policyState.requireRoleForDestructive = true;
-        runtimeContext.role = "admin";
-        runtimeContext.performanceMode = false;
-      } else {
-        policyState.mode = "live-performance";
-        policyState.blockDestructiveDuringPlayback = true;
-        policyState.requireRoleForDestructive = true;
-        runtimeContext.role = "operator";
-        runtimeContext.performanceMode = true;
-      }
-
-      return textResult({ ok: true, policyState, runtimeContext });
-    })
-);
-
-server.registerTool(
   "undo",
   {
     title: "Undo",
@@ -1013,39 +849,6 @@ server.registerTool(
     description: "Redo the previously undone operation in Ableton."
   },
   async () => withMetrics("redo", async () => sendMaybe("/live/song/redo"))
-);
-
-server.registerTool(
-  "create_action_plan_preview",
-  {
-    title: "Create Action Plan Preview",
-    description: "Store a dry preview for a grouped set of actions without executing writes.",
-    inputSchema: {
-      planId: z.string().min(1).max(128),
-      actions: z
-        .array(
-          z.object({
-            action: z.string().min(1).max(64),
-            params: z.record(z.unknown()).default({})
-          })
-        )
-        .min(1)
-    }
-  },
-  async ({ planId, actions }) =>
-    withMetrics("create_action_plan_preview", async () => {
-      const now = new Date().toISOString();
-      const plan = {
-        planId,
-        createdAt: now,
-        dryRun: true,
-        actions,
-        notes:
-          "Preview only. Call execute_action_plan with the same planId to run whitelisted actions, or use dryRun:true to simulate."
-      };
-      pendingPlans.set(planId, plan);
-      return textResult({ ok: true, plan });
-    })
 );
 
 const PLAN_DESTRUCTIVE_ACTIONS = new Set([
@@ -1557,79 +1360,13 @@ async function runActionPlanExecution({
   };
 }
 
-async function preflightActionPlan({ actions, confirmToken, maxCacheAgeMs = 10000 }) {
-  const checks = [];
-  const errors = [];
-  const warnings = [];
-
-  for (let i = 0; i < actions.length; i += 1) {
-    const step = actions[i];
-    const schema = planParamSchemas[step.action];
-    if (!schema) {
-      errors.push({
-        index: i,
-        action: step.action,
-        errorCode: "PLAN_ACTION_UNKNOWN",
-        message: `Unknown or disallowed action "${step.action}".`
-      });
-      continue;
-    }
-    try {
-      schema.parse(step.params ?? {});
-      checks.push({ index: i, action: step.action, ok: true });
-    } catch (error) {
-      errors.push({
-        index: i,
-        action: step.action,
-        errorCode: "PLAN_PARAM_INVALID",
-        message: error.message
-      });
-    }
-  }
-
-  const destructiveInPlan = actions.some((a) => PLAN_DESTRUCTIVE_ACTIONS.has(a.action));
-  if (destructiveInPlan) {
-    if (config.ABLETON_REQUIRE_DESTRUCTIVE_CONFIRM && confirmToken !== DESTRUCTIVE_CONFIRM_TOKEN) {
-      errors.push({
-        errorCode: "DESTRUCTIVE_CONFIRM_REQUIRED",
-        message: `Plan has destructive actions; pass confirmToken="${DESTRUCTIVE_CONFIRM_TOKEN}".`
-      });
-    }
-    if (runtimeContext.performanceMode) {
-      errors.push({
-        errorCode: "POLICY_BLOCKED",
-        message: "Destructive action blocked while performanceMode is enabled."
-      });
-    }
-  }
-
-  const now = Date.now();
-  const last = stateCache.lastRefreshAt ? Date.parse(stateCache.lastRefreshAt) : 0;
-  const stale = !last || now - last > maxCacheAgeMs;
-  if (stale) {
-    warnings.push("State cache is stale; run refresh_state_cache before plan execution.");
-  }
-  if (stateCache.pendingConflicts.length > 0) {
-    warnings.push(...stateCache.pendingConflicts);
-  }
-
-  return {
-    ok: errors.length === 0,
-    checks,
-    warnings,
-    errors,
-    destructiveInPlan
-  };
-}
-
 server.registerTool(
   "execute_action_plan",
   {
     title: "Execute Action Plan",
     description:
-      "Run a stored preview plan or inline actions. Whitelisted actions only; destructive steps require confirmToken. Optional rollback snapshot before destructive steps.",
+      "Run inline whitelisted actions against AbletonOSC. Destructive steps require confirmToken. Optional rollback snapshot before destructive steps. Pass a non-empty actions array (each entry: action name + params matching dispatchPlanAction).",
     inputSchema: {
-      planId: z.string().min(1).max(128).optional(),
       actions: z
         .array(
           z.object({
@@ -1637,7 +1374,7 @@ server.registerTool(
             params: z.record(z.unknown()).default({})
           })
         )
-        .optional(),
+        .min(1),
       confirmToken: z.string().optional(),
       stopOnError: z.boolean().optional().default(true),
       dryRun: z.boolean().optional().default(false),
@@ -1646,8 +1383,7 @@ server.registerTool(
     }
   },
   async ({
-    planId,
-    actions: inlineActions,
+    actions,
     confirmToken,
     stopOnError,
     dryRun,
@@ -1655,15 +1391,6 @@ server.registerTool(
     rollbackSnapshotId
   }) =>
     withMetrics("execute_action_plan", async () => {
-      let actions = inlineActions;
-      if (planId) {
-        const plan = pendingPlans.get(planId);
-        if (!plan) throw new Error(`Unknown planId: ${planId}`);
-        actions = plan.actions;
-      }
-      if (!actions || actions.length === 0) {
-        throw new Error("Provide planId or a non-empty actions array.");
-      }
       const report = await runActionPlanExecution({
         actions,
         confirmToken,
@@ -1672,119 +1399,7 @@ server.registerTool(
         rollbackSnapshotId,
         forceDryRun: dryRun ?? false
       });
-      return textResult({ ok: true, planId: planId ?? null, ...report });
-    })
-);
-
-server.registerTool(
-  "get_action_plan_preview",
-  {
-    title: "Get Action Plan Preview",
-    description: "Retrieve a previously stored action plan preview.",
-    inputSchema: { planId: z.string().min(1).max(128) }
-  },
-  async ({ planId }) =>
-    withMetrics("get_action_plan_preview", async () => {
-      const plan = pendingPlans.get(planId);
-      if (!plan) throw new Error(`Unknown planId: ${planId}`);
-      return textResult({ ok: true, plan });
-    })
-);
-
-server.registerTool(
-  "get_allowed_plan_actions",
-  {
-    title: "Get Allowed Plan Actions",
-    description:
-      "List action names allowed inside create_action_plan_preview / execute_action_plan, plus which require destructive confirmToken."
-  },
-  async () =>
-    textResult({
-      actions: Object.keys(planParamSchemas).sort(),
-      destructiveActions: [...PLAN_DESTRUCTIVE_ACTIONS].sort()
-    })
-);
-
-server.registerTool(
-  "preflight_action_plan",
-  {
-    title: "Preflight Action Plan",
-    description: "Validate action-plan schema/policy/conflicts before execution.",
-    inputSchema: {
-      planId: z.string().min(1).max(128).optional(),
-      actions: z
-        .array(
-          z.object({
-            action: z.string().min(1).max(64),
-            params: z.record(z.unknown()).default({})
-          })
-        )
-        .optional(),
-      confirmToken: z.string().optional(),
-      maxCacheAgeMs: z.number().int().min(1).max(600000).optional().default(10000)
-    }
-  },
-  async ({ planId, actions: inlineActions, confirmToken, maxCacheAgeMs }) =>
-    withMetrics("preflight_action_plan", async () => {
-      let actions = inlineActions;
-      if (planId) {
-        const plan = pendingPlans.get(planId);
-        if (!plan) throw new Error(`Unknown planId: ${planId}`);
-        actions = plan.actions;
-      }
-      if (!actions || actions.length === 0) {
-        throw new Error("Provide planId or a non-empty actions array.");
-      }
-      return textResult(
-        await preflightActionPlan({
-          actions,
-          confirmToken,
-          maxCacheAgeMs
-        })
-      );
-    })
-);
-
-server.registerTool(
-  "get_policy_state",
-  {
-    title: "Get Policy State",
-    description: "Return current policy engine and runtime context."
-  },
-  async () => textResult({ policyState, runtimeContext })
-);
-
-server.registerTool(
-  "set_policy_state",
-  {
-    title: "Set Policy State",
-    description: "Update policy mode and safety toggles.",
-    inputSchema: {
-      mode: z.enum(["safe", "studio", "live-performance"]).optional(),
-      blockDestructiveDuringPlayback: z.boolean().optional(),
-      requireRoleForDestructive: z.boolean().optional(),
-      role: z.enum(["observer", "operator", "admin"]).optional(),
-      performanceMode: z.boolean().optional()
-    }
-  },
-  async ({
-    mode,
-    blockDestructiveDuringPlayback,
-    requireRoleForDestructive,
-    role,
-    performanceMode
-  }) =>
-    withMetrics("set_policy_state", async () => {
-      if (mode !== undefined) policyState.mode = mode;
-      if (blockDestructiveDuringPlayback !== undefined) {
-        policyState.blockDestructiveDuringPlayback = blockDestructiveDuringPlayback;
-      }
-      if (requireRoleForDestructive !== undefined) {
-        policyState.requireRoleForDestructive = requireRoleForDestructive;
-      }
-      if (role !== undefined) runtimeContext.role = role;
-      if (performanceMode !== undefined) runtimeContext.performanceMode = performanceMode;
-      return textResult({ ok: true, policyState, runtimeContext });
+      return textResult({ ok: true, ...report });
     })
 );
 
@@ -1820,47 +1435,6 @@ server.registerTool(
         args,
         { subscribedChannels: stateCache.channels, cachedEvent }
       );
-    })
-);
-
-server.registerTool(
-  "get_session_event_cache",
-  {
-    title: "Get Session Event Cache",
-    description: "Return latest in-memory session event stream cache.",
-    inputSchema: {
-      limit: z.number().int().min(1).max(200).optional().default(50)
-    }
-  },
-  async ({ limit }) =>
-    withMetrics("get_session_event_cache", async () =>
-      textResult({
-        channels: stateCache.channels ?? [],
-        events: (stateCache.eventStream ?? []).slice(-limit)
-      })
-    )
-);
-
-server.registerTool(
-  "detect_plan_conflicts",
-  {
-    title: "Detect Plan Conflicts",
-    description: "Best-effort conflict detector comparing stale cache timestamp vs current state.",
-    inputSchema: {
-      maxCacheAgeMs: z.number().int().min(1).max(600000).optional().default(10000)
-    }
-  },
-  async ({ maxCacheAgeMs }) =>
-    withMetrics("detect_plan_conflicts", async () => {
-      const now = Date.now();
-      const last = stateCache.lastRefreshAt ? Date.parse(stateCache.lastRefreshAt) : 0;
-      const stale = !last || now - last > maxCacheAgeMs;
-      const conflicts = [];
-      if (stale) conflicts.push("State cache is stale; refresh_state_cache before critical plans.");
-      if (runtimeContext.performanceMode)
-        conflicts.push("Performance mode enabled; destructive and high-risk changes should be avoided.");
-      stateCache.pendingConflicts = conflicts;
-      return textResult({ ok: true, stale, conflicts });
     })
 );
 
@@ -1944,35 +1518,6 @@ server.registerTool(
         range: { startBeats, endBeats, startValue, endValue },
         writes: out
       });
-    })
-);
-
-server.registerTool(
-  "list_export_profiles",
-  {
-    title: "List Export Profiles",
-    description: "List named export profiles used by profile render helpers."
-  },
-  async () => textResult({ profiles: Object.fromEntries(exportProfiles) })
-);
-
-server.registerTool(
-  "upsert_export_profile",
-  {
-    title: "Upsert Export Profile",
-    description: "Create or update an export profile.",
-    inputSchema: {
-      profileName: z.string().min(1).max(64),
-      type: z.enum(["master", "stems"]),
-      exportMaster: z.boolean().optional().default(true),
-      normalize: z.boolean().optional().default(false),
-      includeReturns: z.boolean().optional().default(true)
-    }
-  },
-  async ({ profileName, type, exportMaster, normalize, includeReturns }) =>
-    withMetrics("upsert_export_profile", async () => {
-      exportProfiles.set(profileName, { type, exportMaster, normalize, includeReturns });
-      return textResult({ ok: true, profileName, profile: exportProfiles.get(profileName) });
     })
 );
 
@@ -2122,87 +1667,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "get_export_job",
-  {
-    title: "Get Export Job",
-    description: "Return one export job by id.",
-    inputSchema: {
-      jobId: z.string().min(1).max(128)
-    }
-  },
-  async ({ jobId }) =>
-    withMetrics("get_export_job", async () => {
-      const job = exportJobs.get(jobId);
-      if (!job) throw new Error(`Unknown export job: ${jobId}`);
-      return textResult({ job });
-    })
-);
-
-server.registerTool(
-  "list_export_jobs",
-  {
-    title: "List Export Jobs",
-    description: "List recent export jobs.",
-    inputSchema: {
-      limit: z.number().int().min(1).max(200).optional().default(50)
-    }
-  },
-  async ({ limit }) =>
-    withMetrics("list_export_jobs", async () => {
-      const jobs = [...exportJobs.values()]
-        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
-        .slice(0, limit);
-      return textResult({ jobs });
-    })
-);
-
-server.registerTool(
-  "compile_plan_from_intent",
-  {
-    title: "Compile Plan From Intent",
-    description: "Scaffold compiler turning simple natural language intent into action-plan skeleton.",
-    inputSchema: {
-      intent: z.string().min(1).max(500),
-      targetTempo: z.number().min(20).max(300).optional(),
-      targetTrackName: z.string().min(1).max(128).optional()
-    }
-  },
-  async ({ intent, targetTempo, targetTrackName }) =>
-    withMetrics("compile_plan_from_intent", async () => {
-      const actions = [];
-      if (targetTempo !== undefined) actions.push({ action: "set_tempo", params: { bpm: targetTempo } });
-      if (targetTrackName) {
-        actions.push({ action: "set_track_volume_by_name", params: { trackName: targetTrackName, volume: 0.85 } });
-      }
-      if (actions.length === 0) actions.push({ action: "start_playback", params: {} });
-      return textResult({
-        ok: true,
-        intent,
-        compiledPlan: { actions },
-        note: "Scaffold compiler; extend with richer NLP routing and dependency graphing."
-      });
-    })
-);
-
-server.registerTool(
-  "create_conditional_plan",
-  {
-    title: "Create Conditional Plan",
-    description: "Store a conditional/dependency plan schema scaffold for later execution engines.",
-    inputSchema: {
-      planId: z.string().min(1).max(128),
-      conditions: z.array(z.object({ if: z.string(), thenAction: z.string(), elseAction: z.string().optional() })),
-      dependencies: z.array(z.object({ action: z.string(), dependsOn: z.array(z.string()) })).optional()
-    }
-  },
-  async ({ planId, conditions, dependencies }) =>
-    withMetrics("create_conditional_plan", async () => {
-      pendingPlans.set(planId, { planId, conditions, dependencies: dependencies ?? [], type: "conditional-scaffold" });
-      return textResult({ ok: true, planId, type: "conditional-scaffold" });
-    })
-);
-
-server.registerTool(
   "set_track_routing",
   {
     title: "Set Track Routing",
@@ -2254,21 +1718,6 @@ server.registerTool(
         }
       )
     )
-);
-
-server.registerTool(
-  "get_endpoint_capabilities",
-  {
-    title: "Get Endpoint Capabilities",
-    description:
-      "Show probed endpoint variants selected for this AbletonOSC instance."
-  },
-  async () =>
-    textResult({
-      probeSummary,
-      endpointSelections: Object.fromEntries(endpointSelections),
-      knownVariantSets: OSC_ENDPOINT_VARIANTS
-    })
 );
 
 server.registerTool(
@@ -2327,56 +1776,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "warmup_report_recommendations",
-  {
-    title: "Warmup Report Recommendations",
-    description:
-      "Analyze warmup resolution state and suggest concrete OSC endpoint override edits."
-  },
-  async () =>
-    withMetrics("warmup_report_recommendations", async () => {
-      const keys = [
-        "renderAudio",
-        "renderStems",
-        "trackSetRouting",
-        "deviceLoadPreset",
-        "subscribeEvents"
-      ];
-      const unresolved = [];
-      const resolved = [];
-      for (const key of keys) {
-        const selected = endpointSelections.get(key) ?? null;
-        if (selected) {
-          resolved.push({ key, selected });
-        } else {
-          unresolved.push({
-            key,
-            candidates: OSC_ENDPOINT_VARIANTS[key] ?? [],
-            recommendation: `Edit OSC_ENDPOINT_VARIANTS.${key} in src/index.js with the endpoint used by your AbletonOSC fork.`
-          });
-        }
-      }
-
-      const samplePatch = unresolved.reduce((acc, item) => {
-        acc[item.key] = item.candidates;
-        return acc;
-      }, {});
-
-      return textResult({
-        ok: true,
-        resolved,
-        unresolved,
-        recommendationSteps: [
-          "Run warmup_write_endpoints first.",
-          "For unresolved keys, inspect your AbletonOSC docs/logs for the exact endpoint.",
-          "Update OSC_ENDPOINT_VARIANTS in src/index.js and rerun warmup_write_endpoints."
-        ],
-        sampleOverrideObject: samplePatch
-      });
-    })
-);
-
-server.registerTool(
   "find_track_by_name",
   {
     title: "Find Track By Name",
@@ -2404,75 +1803,6 @@ server.registerTool(
         candidates: ranked.slice(0, 10)
       });
     })
-);
-
-server.registerTool(
-  "upsert_alias",
-  {
-    title: "Upsert Alias",
-    description: "Register alias mapping for track/scene/device references.",
-    inputSchema: {
-      alias: z.string().min(1).max(128),
-      targetType: z.enum(["track", "scene", "device", "preset"]),
-      targetValue: z.string().min(1).max(256)
-    }
-  },
-  async ({ alias, targetType, targetValue }) =>
-    withMetrics("upsert_alias", async () => {
-      const key = normalizeName(alias);
-      aliasRegistry.set(key, { alias, targetType, targetValue, updatedAt: new Date().toISOString() });
-      return textResult({ ok: true, alias: aliasRegistry.get(key) });
-    })
-);
-
-server.registerTool(
-  "resolve_alias",
-  {
-    title: "Resolve Alias",
-    description: "Resolve a previously stored alias.",
-    inputSchema: {
-      alias: z.string().min(1).max(128)
-    }
-  },
-  async ({ alias }) =>
-    withMetrics("resolve_alias", async () => {
-      const key = normalizeName(alias);
-      const resolved = aliasRegistry.get(key) ?? null;
-      return textResult({ alias, resolved });
-    })
-);
-
-server.registerTool(
-  "register_device_preset_alias",
-  {
-    title: "Register Device Preset Alias",
-    description: "Register named preset alias for load_device_preset workflows.",
-    inputSchema: {
-      presetAlias: z.string().min(1).max(128),
-      presetName: z.string().min(1).max(256)
-    }
-  },
-  async ({ presetAlias, presetName }) =>
-    withMetrics("register_device_preset_alias", async () => {
-      const key = normalizeName(presetAlias);
-      presetRegistry.set(key, { presetAlias, presetName, updatedAt: new Date().toISOString() });
-      return textResult({ ok: true, preset: presetRegistry.get(key) });
-    })
-);
-
-server.registerTool(
-  "list_alias_registry",
-  {
-    title: "List Alias Registry",
-    description: "Return current alias and preset registries."
-  },
-  async () =>
-    withMetrics("list_alias_registry", async () =>
-      textResult({
-        aliases: Object.fromEntries(aliasRegistry),
-        presets: Object.fromEntries(presetRegistry)
-      })
-    )
 );
 
 async function resolveTrackIndexFromName(trackName, minScore = 0.55) {
@@ -2574,26 +1904,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "get_server_health",
-  {
-    title: "Get Server Health",
-    description: "Return server health, probe status, and command metrics."
-  },
-  async () =>
-    withMetrics("get_server_health", async () =>
-      textResult({
-        status: "ok",
-        startedAt: metrics.startedAt,
-        now: new Date().toISOString(),
-        probeReady: probeSummary !== null,
-        selectedEndpointCount: endpointSelections.size,
-        startupWarnings,
-        metrics
-      })
-    )
-);
-
-server.registerTool(
   "render_project_audio",
   {
     title: "Render Project Audio",
@@ -2637,38 +1947,6 @@ server.registerTool(
         [stringArg(directoryPath), toBoolInt(includeReturns)],
         { directoryPath, includeReturns, destructive: true }
       );
-    })
-);
-
-server.registerTool(
-  "get_metrics_dashboard",
-  {
-    title: "Get Metrics Dashboard",
-    description: "Return human-readable dashboard summary for command activity.",
-    inputSchema: {
-      topN: z.number().int().min(1).max(50).optional().default(10)
-    }
-  },
-  async ({ topN }) =>
-    withMetrics("get_metrics_dashboard", async () => {
-      const entries = Object.entries(metrics.commandDurationsMs)
-        .map(([command, totalMs]) => ({
-          command,
-          totalMs,
-          avgMs: Number((totalMs / Math.max(metrics.totalCommands, 1)).toFixed(2))
-        }))
-        .sort((a, b) => b.totalMs - a.totalMs)
-        .slice(0, topN);
-      return textResult({
-        status: "ok",
-        uptimeSince: metrics.startedAt,
-        totalCommands: metrics.totalCommands,
-        successfulCommands: metrics.successfulCommands,
-        failedCommands: metrics.failedCommands,
-        dryRunCommands: metrics.dryRunCommands,
-        topCommandDurations: entries,
-        lastError: metrics.lastError
-      });
     })
 );
 
@@ -3004,7 +2282,8 @@ server.registerTool(
   "create_midi_clip",
   {
     title: "Create MIDI Clip",
-    description: "Create a new MIDI clip in a slot.",
+    description:
+      "Creates a MIDI clip in a Session View slot (clip_slot), not on the Arrangement timeline. Open Session View (Tab) to see it. clipIndex = vertical scene row for that track.",
     inputSchema: {
       trackIndex: z.number().int().min(0),
       clipIndex: z.number().int().min(0),
@@ -3012,10 +2291,15 @@ server.registerTool(
     }
   },
   async ({ trackIndex, clipIndex, lengthBeats }) =>
-    sendMaybe(
-      "/live/clip_slot/create_clip",
-      [intArg(trackIndex), intArg(clipIndex), floatArg(lengthBeats)],
-      { trackIndex, clipIndex, lengthBeats }
+    withMetrics("create_midi_clip", async () =>
+      textResult({
+        oscSend: sendPlanRaw(
+          "/live/clip_slot/create_clip",
+          [intArg(trackIndex), intArg(clipIndex), floatArg(lengthBeats)],
+          { trackIndex, clipIndex, lengthBeats }
+        ),
+        ...sessionClipPlacementHint(trackIndex, clipIndex)
+      })
     )
 );
 
@@ -3156,6 +2440,108 @@ server.registerTool(
 );
 
 server.registerTool(
+  "set_track_monitoring_mode",
+  {
+    title: "Set Track Monitoring Mode",
+    description:
+      "Sets Live track monitoring (LOM: 0=In, 1=Auto, 2=Off). Use Auto (default) so MIDI clips play; In only passes external input. Requires AbletonOSC track monitoring endpoints.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0),
+      mode: z.enum(["in", "auto", "off"]).optional().default("auto")
+    }
+  },
+  async ({ trackIndex, mode }) =>
+    withMetrics("set_track_monitoring_mode", async () => {
+      const state = monitoringModeToInt(mode);
+      const write = sendMaybe("/live/track/set/current_monitoring_state", [
+        intArg(trackIndex),
+        intArg(state)
+      ]);
+      let previous = null;
+      try {
+        const prevResp = await requestAny(["/live/track/get/current_monitoring_state"], [intArg(trackIndex)]);
+        previous = parseOscValue(prevResp.response, null);
+      } catch {
+        previous = null;
+      }
+      return textResult({
+        ok: true,
+        trackIndex,
+        mode,
+        stateSent: state,
+        stateLabels: { 0: "in", 1: "auto", 2: "off" },
+        previousMonitoringRaw: previous,
+        osc: write,
+        note: "If this OSC address is unsupported, upgrade AbletonOSC or set Monitor to Auto manually in the track I/O strip."
+      });
+    })
+);
+
+server.registerTool(
+  "prepare_midi_track_for_clip_playback",
+  {
+    title: "Prepare MIDI Track For Clip Playback",
+    description:
+      "Common fixes when a Session MIDI clip runs but is silent: set monitoring to Auto, optionally disarm, and report clip MIDI note count. Does not load devices or samples — add Drum Rack/instrument in Live if the chain is empty.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0).optional(),
+      trackName: z.string().min(1).max(128).optional(),
+      clipIndex: z.number().int().min(0).optional().default(0),
+      monitoringMode: z.enum(["in", "auto", "off"]).optional().default("auto"),
+      disarmTrack: z.boolean().optional().default(true)
+    }
+  },
+  async ({ trackIndex, trackName, clipIndex, monitoringMode, disarmTrack }) =>
+    withMetrics("prepare_midi_track_for_clip_playback", async () => {
+      let resolved;
+      if (trackName) {
+        resolved = await resolveTrackIndexFromName(trackName, 0.4);
+      } else if (trackIndex !== undefined && trackIndex !== null) {
+        const snap = await getTracksSnapshot();
+        const row = snap.tracks.find((t) => t.index === trackIndex);
+        resolved = { index: trackIndex, name: row?.name ?? `track_${trackIndex}` };
+      } else {
+        throw new Error("Provide trackIndex or trackName.");
+      }
+      const idx = resolved.index;
+      const state = monitoringModeToInt(monitoringMode);
+      const monitoringWrite = sendMaybe("/live/track/set/current_monitoring_state", [intArg(idx), intArg(state)]);
+      let armWrite = null;
+      if (disarmTrack) {
+        armWrite = sendMaybe("/live/track/set/arm", [intArg(idx), intArg(0)]);
+      }
+      let noteCount = null;
+      let clipNotesError = null;
+      try {
+        const noteResp = await requestAny(["/live/clip/get/notes", "/live/clip/get/notes_extended"], [
+          intArg(idx),
+          intArg(clipIndex)
+        ]);
+        noteCount = extractClipNotes(parseOscValue(noteResp.response, [])).length;
+      } catch (e) {
+        clipNotesError = e.message;
+      }
+      return textResult({
+        ok: true,
+        track: resolved,
+        clipIndex,
+        monitoringMode,
+        stateSent: state,
+        monitoringOsc: monitoringWrite,
+        disarmOsc: armWrite,
+        clipMidiNoteCount: noteCount,
+        clipNotesError,
+        humanStepsIfStillSilent: [
+          "In Live: confirm an instrument (e.g. Drum Rack) is on the device chain and pads have samples.",
+          "Confirm Master volume up and track not muted.",
+          "If clip still empty (0 notes), re-run generate_drum_pattern with the same trackIndex/clipIndex or create_midi_clip first."
+        ],
+        ...sessionClipPlacementHint(idx, clipIndex)
+      });
+    })
+);
+
+server.registerTool(
   "list_scenes",
   {
     title: "List Scenes",
@@ -3263,7 +2649,8 @@ server.registerTool(
   "add_clip_notes",
   {
     title: "Add Clip Notes",
-    description: "Add MIDI notes to a clip.",
+    description:
+      "Add MIDI notes to a Session View clip (trackIndex + clipIndex slot). Open Session View (Tab) to see the clip; see tool response abletonUi.",
     inputSchema: {
       trackIndex: z.number().int().min(0),
       clipIndex: z.number().int().min(0),
@@ -3293,7 +2680,13 @@ server.registerTool(
           intArg(note.mute ? 1 : 0)
         ]);
       }
-      return textResult({ ok: true, trackIndex, clipIndex, notesAdded: notes.length });
+      return textResult({
+        ok: true,
+        trackIndex,
+        clipIndex,
+        notesAdded: notes.length,
+        ...sessionClipPlacementHint(trackIndex, clipIndex)
+      });
     })
 );
 
@@ -3608,309 +3001,59 @@ function extractClipNotes(raw) {
   return notes;
 }
 
-server.registerTool(
-  "compile_musical_intent",
-  {
-    title: "Compile Musical Intent",
-    description: "Convert high-level musical intent into an executable action plan scaffold.",
-    inputSchema: {
-      intent: z.string().min(1).max(500),
-      intensity: z.enum(["low", "medium", "high"]).optional().default("medium"),
-      bars: z.number().int().min(1).max(128).optional().default(8),
-      targetTrackName: z.string().min(1).max(128).optional()
+async function clearClipNotesBestEffort(trackIndex, clipIndex) {
+  const clearCandidates = [
+    "/live/clip/remove/notes",
+    "/live/clip/remove_notes",
+    "/live/clip/clear_notes",
+    "/live/clip/remove_all_notes"
+  ];
+  try {
+    const selected = await selectEndpoint("clipClearNotes", clearCandidates, [intArg(trackIndex), intArg(clipIndex)]);
+    return sendPlanRaw(selected, [intArg(trackIndex), intArg(clipIndex)], {
+      trackIndex,
+      clipIndex,
+      clearEndpoint: selected
+    });
+  } catch (error) {
+    return { ok: false, skipped: true, message: error.message };
+  }
+}
+
+async function resolveDrumMidiTrack({ trackName, trackIndex, allowFirstTrackFallback = false }) {
+  if (trackIndex !== undefined && trackIndex !== null) {
+    const snap = await getTracksSnapshot();
+    const row = snap.tracks.find((t) => t.index === trackIndex);
+    return { index: trackIndex, name: row?.name ?? `track_${trackIndex}`, matchedBy: "trackIndex" };
+  }
+  const tryNames = trackName ? [trackName] : ["Drums", "Drum", "DRUMS", "Kit", "MIDI Drums"];
+  for (const n of tryNames) {
+    try {
+      const r = await resolveTrackIndexFromName(n, 0.35);
+      return { ...r, matchedBy: `trackName:${n}` };
+    } catch {
+      // continue
     }
-  },
-  async ({ intent, intensity, bars, targetTrackName }) =>
-    withMetrics("compile_musical_intent", async () => {
-      const actions = [];
-      const lowered = intent.toLowerCase();
-      if (lowered.includes("build") || lowered.includes("riser")) {
-        actions.push({
-          action: "write_device_automation_curve",
-          params: {
-            trackIndex: 0,
-            deviceIndex: 0,
-            parameterIndex: 0,
-            startBeats: 0,
-            endBeats: bars * 4,
-            startValue: 0.1,
-            endValue: intensity === "high" ? 1 : 0.8,
-            shape: "s-curve",
-            points: 24
-          }
-        });
-      }
-      if (targetTrackName) {
-        actions.push({
-          action: "set_track_volume_by_name",
-          params: {
-            trackName: targetTrackName,
-            volume: intensity === "high" ? 0.9 : 0.82
-          }
-        });
-      }
-      if (actions.length === 0) actions.push({ action: "start_playback", params: {} });
-      return textResult({ ok: true, intent, compiledPlan: { actions }, bars, intensity });
-    })
-);
-
-server.registerTool(
-  "upsert_arrangement_section",
-  {
-    title: "Upsert Arrangement Section",
-    description: "Save or update a named arrangement section in memory.",
-    inputSchema: {
-      sectionName: z.string().min(1).max(64),
-      startBeats: z.number().min(0),
-      bars: z.number().int().min(1).max(256),
-      notes: z.string().max(500).optional()
-    }
-  },
-  async ({ sectionName, startBeats, bars, notes }) =>
-    withMetrics("upsert_arrangement_section", async () => {
-      const key = normalizeName(sectionName);
-      arrangementSectionMap.set(key, {
-        sectionName,
-        startBeats,
-        bars,
-        lengthBeats: bars * 4,
-        notes: notes ?? null,
-        updatedAt: new Date().toISOString()
-      });
-      await persistArrangementSections();
-      return textResult({ ok: true, section: arrangementSectionMap.get(key) });
-    })
-);
-
-server.registerTool(
-  "list_arrangement_sections",
-  {
-    title: "List Arrangement Sections",
-    description: "List all saved named arrangement sections."
-  },
-  async () =>
-    withMetrics("list_arrangement_sections", async () =>
-      textResult({
-        sections: [...arrangementSectionMap.values()].sort((a, b) => a.startBeats - b.startBeats)
-      })
-    )
-);
-
-server.registerTool(
-  "export_arrangement_sections",
-  {
-    title: "Export Arrangement Sections",
-    description: "Export current arrangement section map as JSON payload.",
-    inputSchema: {
-      includeMeta: z.boolean().optional().default(true)
-    }
-  },
-  async ({ includeMeta }) =>
-    withMetrics("export_arrangement_sections", async () => {
-      const sections = [...arrangementSectionMap.entries()];
-      return textResult({
-        ok: true,
-        exportedAt: new Date().toISOString(),
-        count: sections.length,
-        payload: includeMeta
-          ? {
-              version: 1,
-              source: "ableton-osc-bridge",
-              sections
-            }
-          : { sections }
-      });
-    })
-);
-
-server.registerTool(
-  "import_arrangement_sections",
-  {
-    title: "Import Arrangement Sections",
-    description: "Import arrangement section map from JSON payload.",
-    inputSchema: {
-      payload: z.object({
-        sections: z.array(z.tuple([z.string(), z.record(z.unknown())])).min(1)
-      }),
-      merge: z.boolean().optional().default(true)
-    }
-  },
-  async ({ payload, merge }) =>
-    withMetrics("import_arrangement_sections", async () => {
-      if (!merge) arrangementSectionMap.clear();
-      let imported = 0;
-      for (const [key, raw] of payload.sections) {
-        const sectionName =
-          typeof raw.sectionName === "string" && raw.sectionName.trim().length > 0
-            ? raw.sectionName
-            : key;
-        const startBeats = Number(raw.startBeats ?? 0);
-        const bars = Number(raw.bars ?? 8);
-        const lengthBeats = Number(raw.lengthBeats ?? bars * 4);
-        arrangementSectionMap.set(key, {
-          sectionName,
-          startBeats: Number.isFinite(startBeats) ? startBeats : 0,
-          bars: Number.isFinite(bars) && bars > 0 ? Math.round(bars) : 8,
-          lengthBeats: Number.isFinite(lengthBeats) ? lengthBeats : 32,
-          notes: typeof raw.notes === "string" ? raw.notes : null,
-          updatedAt: new Date().toISOString()
-        });
-        imported += 1;
-      }
-      await persistArrangementSections();
-      return textResult({
-        ok: true,
-        merge,
-        imported,
-        totalSections: arrangementSectionMap.size
-      });
-    })
-);
-
-server.registerTool(
-  "save_arrangement_section_profile",
-  {
-    title: "Save Arrangement Section Profile",
-    description: "Save current in-memory section map to a named profile.",
-    inputSchema: {
-      profileName: z.string().min(1).max(128)
-    }
-  },
-  async ({ profileName }) =>
-    withMetrics("save_arrangement_section_profile", async () => {
-      const key = normalizeName(profileName);
-      arrangementSectionProfiles.set(key, {
-        profileName,
-        savedAt: new Date().toISOString(),
-        sections: [...arrangementSectionMap.entries()]
-      });
-      await persistArrangementSectionProfiles();
-      return textResult({
-        ok: true,
-        profileName,
-        sectionCount: arrangementSectionMap.size
-      });
-    })
-);
-
-server.registerTool(
-  "load_arrangement_section_profile",
-  {
-    title: "Load Arrangement Section Profile",
-    description: "Load a named section profile into active in-memory map.",
-    inputSchema: {
-      profileName: z.string().min(1).max(128),
-      merge: z.boolean().optional().default(false)
-    }
-  },
-  async ({ profileName, merge }) =>
-    withMetrics("load_arrangement_section_profile", async () => {
-      const key = normalizeName(profileName);
-      const profile = arrangementSectionProfiles.get(key);
-      if (!profile) throw new Error(`Unknown arrangement section profile: ${profileName}`);
-      if (!merge) arrangementSectionMap.clear();
-      for (const [sectionKey, sectionValue] of profile.sections) {
-        arrangementSectionMap.set(sectionKey, {
-          ...sectionValue,
-          updatedAt: new Date().toISOString()
-        });
-      }
-      await persistArrangementSections();
-      await persistArrangementSectionProfiles();
-      return textResult({
-        ok: true,
-        profileName,
-        merge,
-        totalSections: arrangementSectionMap.size
-      });
-    })
-);
-
-server.registerTool(
-  "clone_arrangement_section_map",
-  {
-    title: "Clone Arrangement Section Map",
-    description: "Clone section profile to another profile name.",
-    inputSchema: {
-      sourceProfileName: z.string().min(1).max(128),
-      targetProfileName: z.string().min(1).max(128),
-      overwrite: z.boolean().optional().default(false)
-    }
-  },
-  async ({ sourceProfileName, targetProfileName, overwrite }) =>
-    withMetrics("clone_arrangement_section_map", async () => {
-      const srcKey = normalizeName(sourceProfileName);
-      const dstKey = normalizeName(targetProfileName);
-      const src = arrangementSectionProfiles.get(srcKey);
-      if (!src) throw new Error(`Unknown source profile: ${sourceProfileName}`);
-      if (!overwrite && arrangementSectionProfiles.has(dstKey)) {
-        throw new Error(`Target profile already exists: ${targetProfileName}. Use overwrite=true.`);
-      }
-      arrangementSectionProfiles.set(dstKey, {
-        profileName: targetProfileName,
-        savedAt: new Date().toISOString(),
-        clonedFrom: sourceProfileName,
-        sections: src.sections.map(([k, v]) => [k, { ...v }])
-      });
-      await persistArrangementSectionProfiles();
-      return textResult({
-        ok: true,
-        sourceProfileName,
-        targetProfileName,
-        sectionCount: src.sections.length
-      });
-    })
-);
-
-server.registerTool(
-  "list_arrangement_section_profiles",
-  {
-    title: "List Arrangement Section Profiles",
-    description: "List saved arrangement section profiles."
-  },
-  async () =>
-    withMetrics("list_arrangement_section_profiles", async () =>
-      textResult({
-        profiles: [...arrangementSectionProfiles.values()].map((p) => ({
-          profileName: p.profileName,
-          savedAt: p.savedAt,
-          clonedFrom: p.clonedFrom ?? null,
-          sectionCount: Array.isArray(p.sections) ? p.sections.length : 0
-        }))
-      })
-    )
-);
-
-server.registerTool(
-  "delete_arrangement_section_profile",
-  {
-    title: "Delete Arrangement Section Profile",
-    description: "Delete a saved arrangement section profile.",
-    inputSchema: { profileName: z.string().min(1).max(128) }
-  },
-  async ({ profileName }) =>
-    withMetrics("delete_arrangement_section_profile", async () => {
-      const deleted = arrangementSectionProfiles.delete(normalizeName(profileName));
-      if (deleted) await persistArrangementSectionProfiles();
-      return textResult({ ok: true, profileName, deleted });
-    })
-);
-
-server.registerTool(
-  "delete_arrangement_section",
-  {
-    title: "Delete Arrangement Section",
-    description: "Delete a saved named arrangement section.",
-    inputSchema: { sectionName: z.string().min(1).max(64) }
-  },
-  async ({ sectionName }) =>
-    withMetrics("delete_arrangement_section", async () => {
-      const key = normalizeName(sectionName);
-      const existed = arrangementSectionMap.delete(key);
-      if (existed) await persistArrangementSections();
-      return textResult({ ok: true, deleted: existed, sectionName });
-    })
-);
+  }
+  const snap = await getTracksSnapshot();
+  const drumLike = /drum|drums|kit|perc|808|snare|kick|hihat|hi-hat|oh|room|breaks/i;
+  const guess = snap.tracks.find((t) => drumLike.test(normalizeName(t.name)));
+  if (guess) return { index: guess.index, name: guess.name, score: 1, matchedBy: "name-heuristic" };
+  if (allowFirstTrackFallback && snap.tracks[0]) {
+    return {
+      index: snap.tracks[0].index,
+      name: snap.tracks[0].name,
+      score: 0.5,
+      matchedBy: "first-track-fallback-opt-in"
+    };
+  }
+  if (!snap.tracks.length) {
+    throw new Error("No tracks in the Live set to write drum MIDI.");
+  }
+  throw new Error(
+    'No drum MIDI track could be resolved safely. Pass trackIndex (e.g. your Drum Rack track), or trackName (e.g. "Drums"), or rename a track to include drum/kit/kick/snare. To use the first session track anyway, pass allowFirstTrackFallback=true (risky if that track is not drums).'
+  );
+}
 
 server.registerTool(
   "arrangement_intelligence",
@@ -4079,7 +3222,8 @@ server.registerTool(
   "generate_midi_phrase",
   {
     title: "Generate MIDI Phrase",
-    description: "Generate key/scale-aware MIDI notes and optionally write into a clip.",
+    description:
+      "Generate key/scale-aware MIDI notes and write into a clip by default (writeToClip=true). Uses Session clip slots (see Session View / Tab — not Arrangement timeline). createClipFirst uses clip_slot/create_clip.",
     inputSchema: {
       trackIndex: z.number().int().min(0),
       clipIndex: z.number().int().min(0),
@@ -4088,31 +3232,72 @@ server.registerTool(
       bars: z.number().int().min(1).max(32).optional().default(4),
       density: z.enum(["low", "medium", "high"]).optional().default("medium"),
       octave: z.number().int().min(1).max(8).optional().default(5),
-      writeToClip: z.boolean().optional().default(false)
+      writeToClip: z.boolean().optional().default(true),
+      createClipFirst: z.boolean().optional().default(true)
     }
   },
-  async ({ trackIndex, clipIndex, key, scale, bars, density, octave, writeToClip }) =>
+  async ({ trackIndex, clipIndex, key, scale, bars, density, octave, writeToClip, createClipFirst }) =>
     withMetrics("generate_midi_phrase", async () => {
       const notes = buildMidiNotePlan({ key, scale, bars, density, octave });
       let writeResult = null;
-      if (writeToClip) {
-        const writes = [];
-        for (const n of notes) {
-          writes.push(
-            sendPlanRaw("/live/clip/add_note", [
-              intArg(trackIndex),
-              intArg(clipIndex),
-              intArg(n.pitch),
-              floatArg(n.start),
-              floatArg(n.duration),
-              intArg(n.velocity),
-              intArg(0)
-            ])
-          );
-        }
-        writeResult = { notesWritten: writes.length };
+      if (!writeToClip) {
+        return textResult({
+          ok: true,
+          trackIndex,
+          clipIndex,
+          key,
+          scale,
+          bars,
+          density,
+          notes,
+          writeResult: null,
+          dryRun: config.ABLETON_DRY_RUN,
+          reminder: "writeToClip=false: no OSC writes. Defaults are now write-enabled."
+        });
       }
-      return textResult({ ok: true, trackIndex, clipIndex, key, scale, bars, density, notes, writeResult });
+      const totalBeats = bars * 4;
+      const clipCreates = [];
+      if (createClipFirst) {
+        clipCreates.push(
+          sendMaybe("/live/clip_slot/create_clip", [
+            intArg(trackIndex),
+            intArg(clipIndex),
+            floatArg(totalBeats)
+          ])
+        );
+      }
+      const writes = [];
+      for (const n of notes) {
+        writes.push(
+          sendPlanRaw("/live/clip/add_note", [
+            intArg(trackIndex),
+            intArg(clipIndex),
+            intArg(n.pitch),
+            floatArg(n.start),
+            floatArg(n.duration),
+            intArg(n.velocity),
+            intArg(0)
+          ])
+        );
+      }
+      writeResult = {
+        notesWritten: writes.length,
+        createClipFirst,
+        clipSlotCreates: clipCreates.length,
+        dryRun: config.ABLETON_DRY_RUN
+      };
+      return textResult({
+        ok: true,
+        trackIndex,
+        clipIndex,
+        key,
+        scale,
+        bars,
+        density,
+        notes,
+        writeResult,
+        ...sessionClipPlacementHint(trackIndex, clipIndex)
+      });
     })
 );
 
@@ -4120,17 +3305,31 @@ server.registerTool(
   "generate_drum_pattern",
   {
     title: "Generate Drum Pattern",
-    description: "Generate drum pattern scaffold with optional variation hints.",
+    description:
+      "GM-style MIDI drums (kick 36, snare 38, hat 42). Writes to Session View clip slots (open Session with Tab); not the Arrangement timeline unless you move the clip. Defaults writeToClip+createClipFirst. Track resolution: trackIndex / trackName / heuristics; allowFirstTrackFallback for track 0. ABLETON_DRY_RUN skips OSC.",
     inputSchema: {
       trackIndex: z.number().int().min(0).optional(),
       clipIndex: z.number().int().min(0).optional(),
+      trackName: z.string().min(1).max(128).optional(),
+      allowFirstTrackFallback: z.boolean().optional().default(false),
       style: z.enum(["house", "techno", "trap", "dnb"]).default("house"),
       bars: z.number().int().min(1).max(16).default(4),
       variation: z.boolean().optional().default(true),
-      writeToClip: z.boolean().optional().default(false)
+      writeToClip: z.boolean().optional().default(true),
+      createClipFirst: z.boolean().optional().default(true)
     }
   },
-  async ({ trackIndex, clipIndex, style, bars, variation, writeToClip }) =>
+  async ({
+    trackIndex,
+    clipIndex,
+    trackName,
+    allowFirstTrackFallback,
+    style,
+    bars,
+    variation,
+    writeToClip,
+    createClipFirst
+  }) =>
     withMetrics("generate_drum_pattern", async () => {
       const base = {
         kick: "1.1,1.2,1.3,1.4",
@@ -4150,31 +3349,57 @@ server.registerTool(
           notes.push({ pitch: 42, start: b + 1.75, duration: 0.08, velocity: 80, mute: false });
         }
       }
-      let writeResult = null;
-      if (writeToClip) {
-        if (trackIndex === undefined || clipIndex === undefined) {
-          throw new Error("trackIndex and clipIndex are required when writeToClip=true.");
-        }
-        const writes = [];
-        for (const note of notes) {
-          writes.push(
-            sendPlanRaw("/live/clip/add_note", [
-              intArg(trackIndex),
-              intArg(clipIndex),
-              intArg(note.pitch),
-              floatArg(note.start),
-              floatArg(note.duration),
-              intArg(note.velocity),
-              intArg(note.mute ? 1 : 0)
-            ])
-          );
-        }
-        writeResult = {
-          trackIndex,
-          clipIndex,
-          notesWritten: writes.length
-        };
+      if (!writeToClip) {
+        return textResult({
+          ok: true,
+          style,
+          bars,
+          basePattern: base,
+          variationHints: variation ? ["Ghost snare before backbeat", "Open hat every 4 bars"] : [],
+          notes,
+          writeResult: null,
+          dryRun: config.ABLETON_DRY_RUN,
+          liveWrite: "off",
+          reminder: "writeToClip=false: preview only. Defaults now write to Live when writeToClip is true."
+        });
       }
+
+      const matched = await resolveDrumMidiTrack({ trackName, trackIndex, allowFirstTrackFallback });
+      const slot = clipIndex ?? 0;
+      const clipCreates = [];
+      if (createClipFirst) {
+        clipCreates.push(
+          sendMaybe("/live/clip_slot/create_clip", [
+            intArg(matched.index),
+            intArg(slot),
+            floatArg(totalBeats)
+          ])
+        );
+      }
+      const writes = [];
+      for (const note of notes) {
+        writes.push(
+          sendPlanRaw("/live/clip/add_note", [
+            intArg(matched.index),
+            intArg(slot),
+            intArg(note.pitch),
+            floatArg(note.start),
+            floatArg(note.duration),
+            intArg(note.velocity),
+            intArg(note.mute ? 1 : 0)
+          ])
+        );
+      }
+      const writeResult = {
+        trackIndex: matched.index,
+        clipIndex: slot,
+        matchedTrackName: matched.name,
+        matchedBy: matched.matchedBy ?? "resolver",
+        createClipFirst,
+        clipSlotCreates: clipCreates.length,
+        notesWritten: writes.length,
+        dryRun: config.ABLETON_DRY_RUN
+      };
       return textResult({
         ok: true,
         style,
@@ -4182,34 +3407,12 @@ server.registerTool(
         basePattern: base,
         variationHints: variation ? ["Ghost snare before backbeat", "Open hat every 4 bars"] : [],
         notes,
-        writeResult
+        writeResult,
+        liveWrite: "notes",
+        dryRun: config.ABLETON_DRY_RUN,
+        ...sessionClipPlacementHint(matched.index, slot)
       });
     })
-);
-
-server.registerTool(
-  "compose_automation_helper",
-  {
-    title: "Compose Automation Helper",
-    description: "Generate automation macro scaffolds (riser, ducking, drop).",
-    inputSchema: {
-      type: z.enum(["riser", "ducking", "drop"]),
-      lengthBeats: z.number().positive().default(16)
-    }
-  },
-  async ({ type, lengthBeats }) =>
-    withMetrics("compose_automation_helper", async () =>
-      textResult({
-        ok: true,
-        type,
-        suggestedPlan:
-          type === "riser"
-            ? [{ action: "write_device_automation_curve", params: { startBeats: 0, endBeats: lengthBeats } }]
-            : type === "ducking"
-              ? [{ action: "set_device_automation_point", params: { timeBeats: 0, value: 0.4 } }]
-              : [{ action: "set_device_automation_point", params: { timeBeats: lengthBeats, value: 1 } }]
-      })
-    )
 );
 
 server.registerTool(
@@ -4230,69 +3433,6 @@ server.registerTool(
       if (sceneIndex === undefined) throw new Error("sceneIndex is required for action=launch");
       return sendMaybe("/live/scene/fire", [intArg(sceneIndex)], { sceneIndex, mode: "performance-launch" });
     })
-);
-
-server.registerTool(
-  "configure_live_safety_rails",
-  {
-    title: "Configure Live Safety Rails",
-    description: "Enable/disable live safety rails and lock track/device lists.",
-    inputSchema: {
-      enabled: z.boolean().optional(),
-      lockedTracks: z.array(z.number().int().min(0)).optional(),
-      lockedDevices: z
-        .array(z.object({ trackIndex: z.number().int().min(0), deviceIndex: z.number().int().min(0) }))
-        .optional()
-    }
-  },
-  async ({ enabled, lockedTracks, lockedDevices }) =>
-    withMetrics("configure_live_safety_rails", async () => {
-      if (enabled !== undefined) liveSafetyState.enabled = enabled;
-      if (lockedTracks !== undefined) liveSafetyState.lockedTracks = [...new Set(lockedTracks)];
-      if (lockedDevices !== undefined) liveSafetyState.lockedDevices = lockedDevices;
-      return textResult({ ok: true, liveSafetyState });
-    })
-);
-
-server.registerTool(
-  "run_project_quality_checks",
-  {
-    title: "Run Project Quality Checks",
-    description: "Run high-level quality diagnostics and return issues list.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("run_project_quality_checks", async () => {
-      const checks = [];
-      if ((stateCache.tracks?.trackCount ?? 0) === 0) checks.push("Track cache is empty; refresh_state_cache.");
-      if (!stateCache.lastRefreshAt) checks.push("No recent state cache snapshot.");
-      if (!probeSummary) checks.push("Capability probe summary not ready yet.");
-      return textResult({ ok: checks.length === 0, issues: checks });
-    })
-);
-
-server.registerTool(
-  "reference_track_workflow",
-  {
-    title: "Reference Track Workflow",
-    description: "Scaffold for A/B reference checks and loudness alignment notes.",
-    inputSchema: {
-      referenceName: z.string().min(1).max(128),
-      targetLufs: z.number().min(-30).max(0).optional().default(-10)
-    }
-  },
-  async ({ referenceName, targetLufs }) =>
-    withMetrics("reference_track_workflow", async () =>
-      textResult({
-        ok: true,
-        referenceName,
-        checklist: [
-          "Route reference to dedicated track and bypass master bus FX.",
-          `Adjust reference gain toward ${targetLufs} LUFS equivalent perceived loudness.`,
-          "Perform 8-bar A/B loop comparison."
-        ]
-      })
-    )
 );
 
 server.registerTool(
@@ -4359,58 +3499,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "set_user_preferences",
-  {
-    title: "Set User Preferences",
-    description: "Store musical/session preferences used by generation tools.",
-    inputSchema: {
-      defaultKey: z.string().min(1).max(3).optional(),
-      defaultScale: z.enum(["major", "minor"]).optional(),
-      defaultTempo: z.number().min(20).max(300).optional(),
-      explanationMode: z.enum(["beginner", "producer"]).optional()
-    }
-  },
-  async ({ defaultKey, defaultScale, defaultTempo, explanationMode }) =>
-    withMetrics("set_user_preferences", async () => {
-      if (defaultKey !== undefined) userPreferences.defaultKey = defaultKey;
-      if (defaultScale !== undefined) userPreferences.defaultScale = defaultScale;
-      if (defaultTempo !== undefined) userPreferences.defaultTempo = defaultTempo;
-      if (explanationMode !== undefined) userPreferences.explanationMode = explanationMode;
-      return textResult({ ok: true, userPreferences });
-    })
-);
-
-server.registerTool(
-  "get_user_preferences",
-  {
-    title: "Get User Preferences",
-    description: "Return current user preference profile."
-  },
-  async () => withMetrics("get_user_preferences", async () => textResult({ userPreferences }))
-);
-
-server.registerTool(
-  "ingest_voice_command",
-  {
-    title: "Ingest Voice Command",
-    description: "Parse voice command text into recommended MCP tool actions.",
-    inputSchema: {
-      commandText: z.string().min(1).max(500)
-    }
-  },
-  async ({ commandText }) =>
-    withMetrics("ingest_voice_command", async () => {
-      const c = commandText.toLowerCase();
-      const suggestion = c.includes("stop")
-        ? { tool: "performance_scene_action", args: { action: "safe_stop" } }
-        : c.includes("tempo")
-          ? { tool: "set_tempo", args: { bpm: userPreferences.defaultTempo } }
-          : { tool: "compile_musical_intent", args: { intent: commandText } };
-      return textResult({ ok: true, commandText, suggestion });
-    })
-);
-
-server.registerTool(
   "semantic_plugin_control",
   {
     title: "Semantic Plugin Control",
@@ -4435,137 +3523,6 @@ server.registerTool(
         [intArg(trackIndex), intArg(deviceIndex), intArg(adjustment.parameterIndex), floatArg(adjustment.value)],
         { prompt, ...adjustment }
       );
-    })
-);
-
-server.registerTool(
-  "generate_collab_handoff",
-  {
-    title: "Generate Collab Handoff",
-    description: "Create a concise handoff summary of current project state and suggested next tasks.",
-    inputSchema: { contextNote: z.string().max(500).optional() }
-  },
-  async ({ contextNote }) =>
-    withMetrics("generate_collab_handoff", async () =>
-      textResult({
-        ok: true,
-        handoff: {
-          overview: "Session scaffold report generated by Ableton MCP bridge.",
-          recentMetrics: {
-            totalCommands: metrics.totalCommands,
-            failedCommands: metrics.failedCommands
-          },
-          nextSteps: [
-            "Run run_mix_health_check before final bounce.",
-            "Use preflight_action_plan for destructive plans.",
-            "Capture snapshot before major arrangement edits."
-          ],
-          contextNote: contextNote ?? null
-        }
-      })
-    )
-);
-
-server.registerTool(
-  "explain_action_for_learning",
-  {
-    title: "Explain Action For Learning",
-    description: "Return beginner/producer explanation for a given action and parameters.",
-    inputSchema: {
-      action: z.string().min(1).max(64),
-      params: z.record(z.unknown()).optional().default({})
-    }
-  },
-  async ({ action, params }) =>
-    withMetrics("explain_action_for_learning", async () => {
-      const mode = userPreferences.explanationMode;
-      const explanation =
-        mode === "beginner"
-          ? `Action "${action}" changes your set with params ${JSON.stringify(params)}. Use dry-run first if unsure.`
-          : `Action "${action}" will be applied with params ${JSON.stringify(params)}; validate against current arrangement and gain staging.`;
-      return textResult({ ok: true, mode, explanation });
-    })
-);
-
-server.registerTool(
-  "upsert_template_pack",
-  {
-    title: "Upsert Template Pack",
-    description: "Store reusable template/pack metadata for future apply workflows.",
-    inputSchema: {
-      name: z.string().min(1).max(128),
-      category: z.enum(["arrangement", "mix", "sound-design", "performance"]),
-      spec: z.record(z.unknown()).optional().default({})
-    }
-  },
-  async ({ name, category, spec }) =>
-    withMetrics("upsert_template_pack", async () => {
-      templateRegistry.set(normalizeName(name), {
-        name,
-        category,
-        spec,
-        updatedAt: new Date().toISOString()
-      });
-      return textResult({ ok: true, template: templateRegistry.get(normalizeName(name)) });
-    })
-);
-
-server.registerTool(
-  "list_template_packs",
-  {
-    title: "List Template Packs",
-    description: "List saved template packs."
-  },
-  async () =>
-    withMetrics("list_template_packs", async () =>
-      textResult({ templates: Object.fromEntries(templateRegistry) })
-    )
-);
-
-server.registerTool(
-  "run_show_mode_checklist",
-  {
-    title: "Run Show Mode Checklist",
-    description: "Run pre-show readiness checklist scaffolding.",
-    inputSchema: {
-      includeSafety: z.boolean().optional().default(true)
-    }
-  },
-  async ({ includeSafety }) =>
-    withMetrics("run_show_mode_checklist", async () => {
-      const checklist = [
-        "Verify audio interface sample rate and buffer size.",
-        "Confirm key scenes and locators are named.",
-        "Test emergency safe stop action."
-      ];
-      if (includeSafety) {
-        checklist.push(
-          liveSafetyState.enabled
-            ? "Live safety rails enabled."
-            : "Enable live safety rails before performance."
-        );
-      }
-      return textResult({ ok: true, checklist, liveSafetyState });
-    })
-);
-
-server.registerTool(
-  "configure_external_hooks",
-  {
-    title: "Configure External Hooks",
-    description: "Enable/disable external ecosystem hook scaffolding.",
-    inputSchema: {
-      notionEnabled: z.boolean().optional(),
-      releaseTrackerEnabled: z.boolean().optional(),
-      backupEnabled: z.boolean().optional()
-    }
-  },
-  async ({ notionEnabled, releaseTrackerEnabled, backupEnabled }) =>
-    withMetrics("configure_external_hooks", async () => {
-      if (notionEnabled !== undefined) externalHooks.notionEnabled = notionEnabled;
-      if (releaseTrackerEnabled !== undefined) externalHooks.releaseTrackerEnabled = releaseTrackerEnabled;
-      if (backupEnabled !== undefined) externalHooks.backupEnabled = backupEnabled;
-      return textResult({ ok: true, externalHooks });
     })
 );
 
@@ -4636,125 +3593,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "build_vocal_chain",
-  {
-    title: "Build Vocal Chain",
-    description: "Scaffold vocal chain setup and parameter recommendations.",
-    inputSchema: {
-      trackName: z.string().min(1).max(128),
-      style: z.enum(["pop", "rap", "indie", "electronic"]).optional().default("pop")
-    }
-  },
-  async ({ trackName, style }) =>
-    withMetrics("build_vocal_chain", async () =>
-      textResult({
-        ok: true,
-        trackName,
-        style,
-        chain: ["HPF EQ", "De-esser", "Compressor", "Saturation", "Delay Send", "Reverb Send"]
-      })
-    )
-);
-
-server.registerTool(
-  "repair_clip_timing",
-  {
-    title: "Repair Clip Timing",
-    description: "Scaffold clip timing correction recommendations.",
-    inputSchema: {
-      trackIndex: z.number().int().min(0),
-      clipIndex: z.number().int().min(0),
-      strength: z.number().min(0).max(1).optional().default(0.7)
-    }
-  },
-  async ({ trackIndex, clipIndex, strength }) =>
-    withMetrics("repair_clip_timing", async () =>
-      textResult({
-        ok: true,
-        trackIndex,
-        clipIndex,
-        strength,
-        recommendation: "Apply quantize then nudge groove timing by analyzed offset."
-      })
-    )
-);
-
-server.registerTool(
-  "build_transition_between_sections",
-  {
-    title: "Build Transition Between Sections",
-    description: "Generate transition plan between two named sections.",
-    inputSchema: {
-      fromSection: z.string().min(1).max(64),
-      toSection: z.string().min(1).max(64),
-      bars: z.number().int().min(1).max(16).optional().default(4)
-    }
-  },
-  async ({ fromSection, toSection, bars }) =>
-    withMetrics("build_transition_between_sections", async () =>
-      textResult({
-        ok: true,
-        fromSection,
-        toSection,
-        bars,
-        actions: ["Riser automation", "Drum fill trigger", "Bass low-cut sweep", "Reverb tail throw"]
-      })
-    )
-);
-
-server.registerTool(
-  "shape_section_energy",
-  {
-    title: "Shape Section Energy",
-    description: "Apply section-level energy shaping scaffold.",
-    inputSchema: {
-      sectionName: z.string().min(1).max(64),
-      targetEnergy: z.enum(["low", "medium", "high"])
-    }
-  },
-  async ({ sectionName, targetEnergy }) =>
-    withMetrics("shape_section_energy", async () =>
-      textResult({
-        ok: true,
-        sectionName,
-        targetEnergy,
-        recipe:
-          targetEnergy === "low"
-            ? ["Lower hats", "Reduce high shelf", "Cut reverb send"]
-            : targetEnergy === "medium"
-              ? ["Moderate drum bus", "Balanced mids", "Controlled FX"]
-              : ["Boost drum bus", "Open filters", "Increase send FX"]
-      })
-    )
-);
-
-server.registerTool(
-  "configure_adaptive_macro_performer",
-  {
-    title: "Configure Adaptive Macro Performer",
-    description: "Create performance macro mapping scaffold for knobs.",
-    inputSchema: {
-      macroName: z.string().min(1).max(128),
-      mappings: z
-        .array(
-          z.object({
-            knob: z.number().int().min(1).max(8),
-            target: z.string().min(1).max(128),
-            min: z.number().min(0).max(1),
-            max: z.number().min(0).max(1)
-          })
-        )
-        .min(1)
-    }
-  },
-  async ({ macroName, mappings }) =>
-    withMetrics("configure_adaptive_macro_performer", async () => {
-      macroRegistry.set(normalizeName(macroName), { name: macroName, mappings, type: "adaptive-performer" });
-      return textResult({ ok: true, macro: macroRegistry.get(normalizeName(macroName)) });
-    })
-);
-
-server.registerTool(
   "auto_gain_stage_tracks",
   {
     title: "Auto Gain Stage Tracks",
@@ -4820,43 +3658,6 @@ server.registerTool(
         writes
       });
     })
-);
-
-server.registerTool(
-  "set_latency_safe_recording_mode",
-  {
-    title: "Set Latency Safe Recording Mode",
-    description: "Toggle low-latency recording behavior scaffold.",
-    inputSchema: { enabled: z.boolean() }
-  },
-  async ({ enabled }) =>
-    withMetrics("set_latency_safe_recording_mode", async () =>
-      textResult({
-        ok: true,
-        enabled,
-        actions: enabled
-          ? ["Disable heavy FX chains", "Set low buffer profile", "Arm recording tracks"]
-          : ["Re-enable FX chains", "Restore mixing buffer profile"]
-      })
-    )
-);
-
-server.registerTool(
-  "arrangement_completion_assistant",
-  {
-    title: "Arrangement Completion Assistant",
-    description: "Identify missing structure blocks and propose completion.",
-    inputSchema: { targetStyle: z.string().min(1).max(64).optional().default("electronic") }
-  },
-  async ({ targetStyle }) =>
-    withMetrics("arrangement_completion_assistant", async () =>
-      textResult({
-        ok: true,
-        targetStyle,
-        missingCandidates: ["Intro", "Breakdown", "Outro"],
-        proposedPlan: ["Add 8-bar intro", "Add 16-bar breakdown before final drop"]
-      })
-    )
 );
 
 server.registerTool(
@@ -4999,222 +3800,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "smart_sample_audit",
-  {
-    title: "Smart Sample Audit",
-    description: "Run sample audit scaffold for missing/unused/duplicate samples.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("smart_sample_audit", async () =>
-      textResult({
-        ok: true,
-        findings: ["No filesystem scan in scaffold mode", "Integrate project sample index provider next"]
-      })
-    )
-);
-
-server.registerTool(
-  "schedule_macro_timeline",
-  {
-    title: "Schedule Macro Timeline",
-    description: "Schedule macro trigger at bar position.",
-    inputSchema: {
-      macroName: z.string().min(1).max(128),
-      bar: z.number().int().min(1),
-      enabled: z.boolean().optional().default(true)
-    }
-  },
-  async ({ macroName, bar, enabled }) =>
-    withMetrics("schedule_macro_timeline", async () => {
-      const key = `${normalizeName(macroName)}@${bar}`;
-      macroSchedule.set(key, { macroName, bar, enabled, updatedAt: new Date().toISOString() });
-      return textResult({ ok: true, schedule: macroSchedule.get(key) });
-    })
-);
-
-server.registerTool(
-  "configure_live_improv_guardrails",
-  {
-    title: "Configure Live Improv Guardrails",
-    description: "Set improv safety behavior and autosnapshot cadence scaffold.",
-    inputSchema: {
-      enabled: z.boolean(),
-      autoSnapshotBars: z.number().int().min(1).max(128).optional().default(8)
-    }
-  },
-  async ({ enabled, autoSnapshotBars }) =>
-    withMetrics("configure_live_improv_guardrails", async () => {
-      liveSafetyState.enabled = enabled;
-      return textResult({ ok: true, enabled, autoSnapshotBars, liveSafetyState });
-    })
-);
-
-server.registerTool(
-  "diagnose_mix_issue",
-  {
-    title: "Diagnose Mix Issue",
-    description: "Map problem statements to concrete remediation suggestions.",
-    inputSchema: { issue: z.string().min(1).max(256) }
-  },
-  async ({ issue }) =>
-    withMetrics("diagnose_mix_issue", async () => {
-      const i = issue.toLowerCase();
-      const suggestions = i.includes("kick") && i.includes("bass")
-        ? ["Sidechain bass to kick", "Cut 50-80Hz on bass slightly", "Shorten kick tail"]
-        : i.includes("mud")
-          ? ["Reduce 200-400Hz bus buildup", "High-pass non-bass elements"]
-          : ["Check gain staging", "Check arrangement density", "A/B with reference"];
-      return textResult({ ok: true, issue, suggestions });
-    })
-);
-
-server.registerTool(
-  "optimize_plugin_chain",
-  {
-    title: "Optimize Plugin Chain",
-    description: "Suggest CPU/latency optimization scaffold for plugin chains.",
-    inputSchema: { trackName: z.string().min(1).max(128) }
-  },
-  async ({ trackName }) =>
-    withMetrics("optimize_plugin_chain", async () =>
-      textResult({
-        ok: true,
-        trackName,
-        optimizations: [
-          "Move linear-phase processors to mixdown stage",
-          "Freeze heavy synth tracks",
-          "Consolidate redundant EQ instances"
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "set_session_goal",
-  {
-    title: "Set Session Goal",
-    description: "Create guided session goal and checkpoints.",
-    inputSchema: {
-      goalName: z.string().min(1).max(128),
-      minutes: z.number().int().min(5).max(300)
-    }
-  },
-  async ({ goalName, minutes }) =>
-    withMetrics("set_session_goal", async () => {
-      sessionGoals.set(normalizeName(goalName), {
-        goalName,
-        minutes,
-        checkpoints: ["Plan", "Execute", "Review"],
-        createdAt: new Date().toISOString()
-      });
-      return textResult({ ok: true, goal: sessionGoals.get(normalizeName(goalName)) });
-    })
-);
-
-server.registerTool(
-  "manage_setlist",
-  {
-    title: "Manage Setlist",
-    description: "Manage multi-song setlist scaffold entries.",
-    inputSchema: {
-      action: z.enum(["add", "remove", "list"]),
-      songName: z.string().min(1).max(128).optional()
-    }
-  },
-  async ({ action, songName }) =>
-    withMetrics("manage_setlist", async () => {
-      const key = "default";
-      const current = setlistRegistry.get(key) ?? [];
-      if (action === "add") {
-        if (!songName) throw new Error("songName required for add.");
-        current.push(songName);
-        setlistRegistry.set(key, current);
-      } else if (action === "remove") {
-        if (!songName) throw new Error("songName required for remove.");
-        setlistRegistry.set(
-          key,
-          current.filter((s) => normalizeName(s) !== normalizeName(songName))
-        );
-      }
-      return textResult({ ok: true, songs: setlistRegistry.get(key) ?? [] });
-    })
-);
-
-server.registerTool(
-  "export_session_documentation",
-  {
-    title: "Export Session Documentation",
-    description: "Generate session documentation summary from runtime metrics and context.",
-    inputSchema: {
-      note: z.string().max(500).optional()
-    }
-  },
-  async ({ note }) =>
-    withMetrics("export_session_documentation", async () =>
-      textResult({
-        ok: true,
-        generatedAt: new Date().toISOString(),
-        summary: {
-          totalCommands: metrics.totalCommands,
-          failedCommands: metrics.failedCommands,
-          lastError: metrics.lastError
-        },
-        note: note ?? null
-      })
-    )
-);
-
-server.registerTool(
-  "ai_arrangement_rewrite",
-  {
-    title: "AI Arrangement Rewrite",
-    description: "Generate reversible arrangement rewrite plan by style intent.",
-    inputSchema: {
-      targetStyle: z.string().min(1).max(64),
-      intensity: z.enum(["low", "medium", "high"]).optional().default("medium")
-    }
-  },
-  async ({ targetStyle, intensity }) =>
-    withMetrics("ai_arrangement_rewrite", async () =>
-      textResult({
-        ok: true,
-        targetStyle,
-        intensity,
-        reversiblePlan: [
-          { action: "arrangement_duplicate_range", params: { startBeats: 0, lengthBeats: 32 } },
-          { action: "write_device_automation_curve", params: { shape: "s-curve", points: 24 } }
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "drum_replacement_assistant",
-  {
-    title: "Drum Replacement Assistant",
-    description: "Suggest drum replacement/layering strategy by context.",
-    inputSchema: {
-      drumRole: z.enum(["kick", "snare", "hats", "perc"]),
-      targetCharacter: z.string().min(1).max(64)
-    }
-  },
-  async ({ drumRole, targetCharacter }) =>
-    withMetrics("drum_replacement_assistant", async () =>
-      textResult({
-        ok: true,
-        drumRole,
-        targetCharacter,
-        suggestions: [
-          `Layer transient-focused ${drumRole} sample`,
-          "Phase-align replacement with original",
-          "Blend parallel saturation bus"
-        ]
-      })
-    )
-);
-
-server.registerTool(
   "resolve_kick_bass_conflict",
   {
     title: "Resolve Kick Bass Conflict",
@@ -5283,119 +3868,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "advanced_vocal_polish",
-  {
-    title: "Advanced Vocal Polish",
-    description: "Provide advanced vocal polish checklist and chain moves.",
-    inputSchema: {
-      mode: z.enum(["tight", "natural", "glossy"]).optional().default("natural")
-    }
-  },
-  async ({ mode }) =>
-    withMetrics("advanced_vocal_polish", async () =>
-      textResult({
-        ok: true,
-        mode,
-        steps: ["De-ess", "Level compression", "Timing tighten", "Parallel air band", "Space effects"]
-      })
-    )
-);
-
-server.registerTool(
-  "transform_genre_template",
-  {
-    title: "Transform Genre Template",
-    description: "Transform session direction toward genre template scaffold.",
-    inputSchema: {
-      genre: z.enum(["house", "techno", "trap", "dnb", "cinematic"]),
-      preserveMelody: z.boolean().optional().default(true)
-    }
-  },
-  async ({ genre, preserveMelody }) =>
-    withMetrics("transform_genre_template", async () =>
-      textResult({
-        ok: true,
-        genre,
-        preserveMelody,
-        changes: ["Adjust groove density", "Rebalance low end", "Apply genre transition structure"]
-      })
-    )
-);
-
-server.registerTool(
-  "detect_section_similarity",
-  {
-    title: "Detect Section Similarity",
-    description: "Find likely repetitive sections and suggest variation ideas.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("detect_section_similarity", async () => {
-      const sections = [...arrangementSectionMap.values()].sort((a, b) => a.startBeats - b.startBeats);
-      const findings = [];
-      for (let i = 1; i < sections.length; i += 1) {
-        if (sections[i].bars === sections[i - 1].bars) {
-          findings.push({
-            a: sections[i - 1].sectionName,
-            b: sections[i].sectionName,
-            suggestion: "Add fill + automation variation in second section."
-          });
-        }
-      }
-      return textResult({ ok: true, findings });
-    })
-);
-
-server.registerTool(
-  "generate_drop_builder_plan",
-  {
-    title: "Generate Drop Builder Plan",
-    description: "Create pre-drop tension and drop impact action plan.",
-    inputSchema: {
-      bars: z.number().int().min(1).max(16).optional().default(8),
-      intensity: z.enum(["low", "medium", "high"]).optional().default("high")
-    }
-  },
-  async ({ bars, intensity }) =>
-    withMetrics("generate_drop_builder_plan", async () =>
-      textResult({
-        ok: true,
-        bars,
-        intensity,
-        plan: [
-          "Filter sweep up on build bus",
-          "Snare roll acceleration",
-          "One-beat silence before drop",
-          "Sub + kick impact restore"
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "write_dynamic_bus_automation",
-  {
-    title: "Write Dynamic Bus Automation",
-    description: "Create bus automation movement scaffold.",
-    inputSchema: {
-      busName: z.string().min(1).max(64),
-      startBeats: z.number().min(0),
-      endBeats: z.number().gt(0),
-      startValue: z.number().min(0).max(1),
-      endValue: z.number().min(0).max(1)
-    }
-  },
-  async ({ busName, startBeats, endBeats, startValue, endValue }) =>
-    withMetrics("write_dynamic_bus_automation", async () =>
-      textResult({
-        ok: true,
-        busName,
-        suggestedAutomation: { startBeats, endBeats, startValue, endValue, shape: "s-curve" }
-      })
-    )
-);
-
-server.registerTool(
   "run_release_readiness_score",
   {
     title: "Run Release Readiness Score",
@@ -5446,154 +3918,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "intelligent_freeze_manager",
-  {
-    title: "Intelligent Freeze Manager",
-    description: "Suggest freeze candidates for CPU-heavy tracks scaffold.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("intelligent_freeze_manager", async () =>
-      textResult({
-        ok: true,
-        note: "CPU profiling integration pending; scaffold returns candidate strategy.",
-        strategy: ["Freeze heavy synth tracks", "Flatten committed audio FX prints"]
-      })
-    )
-);
-
-server.registerTool(
-  "set_session_focus_mode",
-  {
-    title: "Set Session Focus Mode",
-    description: "Set session focus mode by production goal.",
-    inputSchema: {
-      mode: z.enum(["arrangement", "sound-design", "mixing", "performance", "off"])
-    }
-  },
-  async ({ mode }) =>
-    withMetrics("set_session_focus_mode", async () =>
-      textResult({
-        ok: true,
-        mode,
-        focusActions:
-          mode === "off" ? ["Restore all tracks/tools"] : [`Prioritize ${mode} toolset`, "De-prioritize unrelated actions"]
-      })
-    )
-);
-
-server.registerTool(
-  "contextual_coaching_assistant",
-  {
-    title: "Contextual Coaching Assistant",
-    description: "Explain why recommended actions help in current context.",
-    inputSchema: {
-      topic: z.string().min(1).max(128)
-    }
-  },
-  async ({ topic }) =>
-    withMetrics("contextual_coaching_assistant", async () =>
-      textResult({
-        ok: true,
-        topic,
-        coaching: `For "${topic}", prioritize clarity and headroom before adding complexity.`
-      })
-    )
-);
-
-server.registerTool(
-  "rank_recording_takes",
-  {
-    title: "Rank Recording Takes",
-    description: "Rank takes by weighted criteria scaffold.",
-    inputSchema: {
-      takes: z.array(z.string().min(1).max(128)).min(1),
-      criteria: z
-        .object({
-          timing: z.number().min(0).max(1).optional().default(0.4),
-          pitch: z.number().min(0).max(1).optional().default(0.3),
-          energy: z.number().min(0).max(1).optional().default(0.3)
-        })
-        .optional()
-    }
-  },
-  async ({ takes, criteria }) =>
-    withMetrics("rank_recording_takes", async () => {
-      const c = criteria ?? { timing: 0.4, pitch: 0.3, energy: 0.3 };
-      const ranked = takes
-        .map((name, i) => ({
-          take: name,
-          score: Number((100 - i * 7 + c.timing * 10 + c.pitch * 8 + c.energy * 9).toFixed(2))
-        }))
-        .sort((a, b) => b.score - a.score);
-      return textResult({ ok: true, criteria: c, ranked });
-    })
-);
-
-server.registerTool(
-  "reference_aware_tonal_targeting",
-  {
-    title: "Reference Aware Tonal Targeting",
-    description: "Suggest tonal targeting moves against a reference.",
-    inputSchema: {
-      referenceName: z.string().min(1).max(128)
-    }
-  },
-  async ({ referenceName }) =>
-    withMetrics("reference_aware_tonal_targeting", async () =>
-      textResult({
-        ok: true,
-        referenceName,
-        targets: ["Tighten 60-100Hz", "Smooth 2-4kHz harshness", "Match top-end air balance"]
-      })
-    )
-);
-
-server.registerTool(
-  "create_creative_prompt_scene",
-  {
-    title: "Create Creative Prompt Scene",
-    description: "Generate scene concept from creative prompt scaffold.",
-    inputSchema: {
-      prompt: z.string().min(1).max(256)
-    }
-  },
-  async ({ prompt }) =>
-    withMetrics("create_creative_prompt_scene", async () =>
-      textResult({
-        ok: true,
-        prompt,
-        sceneConcept: {
-          layers: ["pad texture", "motif arpeggio", "fx shimmer"],
-          automation: "Slow filter open over 8 bars"
-        }
-      })
-    )
-);
-
-server.registerTool(
-  "live_performance_cue_engine",
-  {
-    title: "Live Performance Cue Engine",
-    description: "Return timed cue sequence for live actions.",
-    inputSchema: {
-      barsAhead: z.number().int().min(1).max(64).optional().default(16)
-    }
-  },
-  async ({ barsAhead }) =>
-    withMetrics("live_performance_cue_engine", async () =>
-      textResult({
-        ok: true,
-        cues: [
-          { atBarOffset: 4, cue: "Prepare filter sweep" },
-          { atBarOffset: 8, cue: "Trigger transition fx" },
-          { atBarOffset: Math.max(12, barsAhead - 2), cue: "Ready drop launch" }
-        ]
-      })
-    )
-);
-
-server.registerTool(
   "error_recovery_autopilot",
   {
     title: "Error Recovery Autopilot",
@@ -5612,296 +3936,47 @@ server.registerTool(
 );
 
 server.registerTool(
-  "set_project_memory_profile",
-  {
-    title: "Set Project Memory Profile",
-    description: "Store reusable multi-project memory preferences.",
-    inputSchema: {
-      profileName: z.string().min(1).max(128),
-      preferences: z.record(z.unknown()).optional().default({})
-    }
-  },
-  async ({ profileName, preferences }) =>
-    withMetrics("set_project_memory_profile", async () => {
-      projectMemory.set(normalizeName(profileName), {
-        profileName,
-        preferences,
-        updatedAt: new Date().toISOString()
-      });
-      return textResult({ ok: true, profile: projectMemory.get(normalizeName(profileName)) });
-    })
-);
-
-server.registerTool(
-  "generate_release_variants",
-  {
-    title: "Generate Release Variants",
-    description: "Generate release variant scaffold plan.",
-    inputSchema: {
-      includeExtended: z.boolean().optional().default(true),
-      includeInstrumental: z.boolean().optional().default(true),
-      includeAcapella: z.boolean().optional().default(true)
-    }
-  },
-  async ({ includeExtended, includeInstrumental, includeAcapella }) =>
-    withMetrics("generate_release_variants", async () =>
-      textResult({
-        ok: true,
-        variants: [
-          includeExtended ? "extended_mix" : null,
-          includeInstrumental ? "instrumental" : null,
-          includeAcapella ? "acapella" : null
-        ].filter(Boolean)
-      })
-    )
-);
-
-server.registerTool(
-  "run_post_export_qa",
-  {
-    title: "Run Post Export QA",
-    description: "Run post-export QA checks on generated deliverables jobs.",
-    inputSchema: {
-      requireCompletedJobs: z.boolean().optional().default(true),
-      strictMatrix: z.boolean().optional().default(false),
-      expectedVariants: z
-        .array(
-          z.enum(["master", "streaming", "stems", "instrumental", "acapella", "extended"])
-        )
-        .optional()
-        .default(["master", "streaming", "stems"])
-    }
-  },
-  async ({ requireCompletedJobs, strictMatrix, expectedVariants }) =>
-    withMetrics("run_post_export_qa", async () => {
-      const jobs = [...exportJobs.values()];
-      const completed = jobs.filter((j) => j.status === "completed");
-      const failed = jobs.filter((j) => j.status === "failed");
-      const pending = jobs.filter((j) => j.status !== "completed" && j.status !== "failed");
-      const issues = [];
-      if (requireCompletedJobs && completed.length === 0) {
-        issues.push("No completed export jobs found.");
-      }
-      if (failed.length > 0) issues.push(`${failed.length} export jobs failed.`);
-
-      // Consistency checks by known deliverable patterns.
-      const targets = completed.map((j) => String(j.targetPath ?? "").toLowerCase());
-      const hasMaster = targets.some((t) => t.includes("master"));
-      const hasStreaming = targets.some((t) => t.includes("streaming"));
-      const hasStems = targets.some((t) => t.includes("stems"));
-      if (!hasMaster) issues.push("Missing master deliverable.");
-      if (!hasStreaming) issues.push("Missing streaming deliverable.");
-      if (!hasStems) issues.push("Missing stems deliverable.");
-
-      const duplicateTargets = new Set();
-      const seen = new Set();
-      for (const t of targets) {
-        if (seen.has(t)) duplicateTargets.add(t);
-        seen.add(t);
-      }
-      if (duplicateTargets.size > 0) {
-        issues.push(`Duplicate target paths detected: ${[...duplicateTargets].join(", ")}`);
-      }
-
-      const checks = {
-        master: hasMaster,
-        streaming: hasStreaming,
-        stems: hasStems,
-        instrumental: targets.some((t) => t.includes("instrumental")),
-        acapella: targets.some((t) => t.includes("acapella")),
-        extended: targets.some((t) => t.includes("extended"))
-      };
-      const matrixMissing = expectedVariants.filter((v) => !checks[v]);
-      if (strictMatrix && matrixMissing.length > 0) {
-        issues.push(`Strict matrix missing variants: ${matrixMissing.join(", ")}`);
-      }
-
-      return textResult({
-        ok: issues.length === 0,
-        summary: {
-          total: jobs.length,
-          completed: completed.length,
-          failed: failed.length,
-          pending: pending.length
-        },
-        consistency: {
-          hasMaster,
-          hasStreaming,
-          hasStems,
-          duplicateTargets: [...duplicateTargets],
-          strictMatrix,
-          expectedVariants,
-          matrixMissing
-        },
-        issues
-      });
-    })
-);
-
-server.registerTool(
-  "normalize_stem_naming",
-  {
-    title: "Normalize Stem Naming",
-    description: "Generate normalized stem naming plan.",
-    inputSchema: {
-      songName: z.string().min(1).max(128),
-      bpm: z.number().min(20).max(300),
-      key: z.string().min(1).max(8),
-      variants: z.array(z.string().min(1).max(64)).min(1)
-    }
-  },
-  async ({ songName, bpm, key, variants }) =>
-    withMetrics("normalize_stem_naming", async () => {
-      const base = normalizeName(songName).replace(/\s+/g, "_");
-      const names = variants.map((v) => `${base}_${bpm}_${normalizeName(key)}_${normalizeName(v)}.wav`);
-      return textResult({ ok: true, names });
-    })
-);
-
-server.registerTool(
-  "target_prerelease_loudness",
-  {
-    title: "Target Pre-release Loudness",
-    description: "Suggest loudness target profile and actions.",
-    inputSchema: { profile: z.enum(["streaming", "club", "film"]).optional().default("streaming") }
-  },
-  async ({ profile }) =>
-    withMetrics("target_prerelease_loudness", async () =>
-      textResult({
-        ok: true,
-        profile,
-        target:
-          profile === "streaming" ? "-14 LUFS" : profile === "club" ? "-9 LUFS" : "-18 LUFS",
-        actions: ["Adjust limiter ceiling", "Re-check transient integrity", "Run post-export QA"]
-      })
-    )
-);
-
-server.registerTool(
-  "find_arrangement_gaps",
-  {
-    title: "Find Arrangement Gaps",
-    description: "Detect potential arrangement gaps from section map.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("find_arrangement_gaps", async () => {
-      const sections = [...arrangementSectionMap.values()].sort((a, b) => a.startBeats - b.startBeats);
-      const gaps = [];
-      for (let i = 1; i < sections.length; i += 1) {
-        const prevEnd = sections[i - 1].startBeats + sections[i - 1].lengthBeats;
-        if (sections[i].startBeats - prevEnd > 0.01) {
-          gaps.push({
-            from: sections[i - 1].sectionName,
-            to: sections[i].sectionName,
-            gapBeats: Number((sections[i].startBeats - prevEnd).toFixed(3))
-          });
-        }
-      }
-      return textResult({ ok: true, gaps });
-    })
-);
-
-server.registerTool(
-  "reinforce_hook_section",
-  {
-    title: "Reinforce Hook Section",
-    description: "Suggest hook reinforcement moves.",
-    inputSchema: { sectionName: z.string().min(1).max(64) }
-  },
-  async ({ sectionName }) =>
-    withMetrics("reinforce_hook_section", async () =>
-      textResult({
-        ok: true,
-        sectionName,
-        moves: ["Double lead octave", "Add call-response fill", "Increase hook send FX by 10%"]
-      })
-    )
-);
-
-server.registerTool(
-  "optimize_kick_transient",
-  {
-    title: "Optimize Kick Transient",
-    description: "Kick transient optimization scaffold.",
-    inputSchema: { kickTrackName: z.string().min(1).max(128) }
-  },
-  async ({ kickTrackName }) =>
-    withMetrics("optimize_kick_transient", async () =>
-      textResult({
-        ok: true,
-        kickTrackName,
-        recipe: ["Shorten sustain", "Boost transient 2-4kHz lightly", "Manage low-end tail overlap"]
-      })
-    )
-);
-
-server.registerTool(
-  "check_bass_mono_compatibility",
-  {
-    title: "Check Bass Mono Compatibility",
-    description: "Bass mono compatibility diagnostic scaffold.",
-    inputSchema: { bassTrackName: z.string().min(1).max(128) }
-  },
-  async ({ bassTrackName }) =>
-    withMetrics("check_bass_mono_compatibility", async () =>
-      textResult({
-        ok: true,
-        bassTrackName,
-        checks: ["Low band width under 120Hz", "Phase correlation near +1 in low end"]
-      })
-    )
-);
-
-server.registerTool(
   "set_drum_bus_punch_mode",
   {
     title: "Set Drum Bus Punch Mode",
-    description: "Apply drum bus punch mode scaffold settings.",
+    description:
+      "Sends best-effort device parameter tweaks on drum-like tracks (enabled defaults true). Proxy mapping on device 0; verify device chain in Live.",
     inputSchema: { enabled: z.boolean().optional().default(true) }
   },
   async ({ enabled }) =>
-    withMetrics("set_drum_bus_punch_mode", async () =>
-      textResult({
+    withMetrics("set_drum_bus_punch_mode", async () => {
+      const tracks = await getTracksSnapshot();
+      const targets = tracks.tracks
+        .filter((t) => /drum|kit|kick|snare|perc|808/i.test(normalizeName(t.name)))
+        .slice(0, 8);
+      const writes = [];
+      for (const t of targets) {
+        const thresh = enabled ? 0.52 + Math.random() * 0.08 : 0.62;
+        const rel = enabled ? 0.35 : 0.55;
+        writes.push(
+          sendPlanRaw(
+            "/live/device/set/parameter/value",
+            [intArg(t.index), intArg(0), intArg(2), floatArg(thresh)],
+            { trackIndex: t.index, parameter: "punch-threshold-proxy", enabled }
+          )
+        );
+        writes.push(
+          sendPlanRaw(
+            "/live/device/set/parameter/value",
+            [intArg(t.index), intArg(0), intArg(3), floatArg(rel)],
+            { trackIndex: t.index, parameter: "punch-release-proxy", enabled }
+          )
+        );
+      }
+      return textResult({
         ok: true,
         enabled,
-        settings: enabled ? ["Fast attack transient shaper", "Parallel comp blend 20-30%"] : ["Bypass punch chain"]
-      })
-    )
-);
-
-server.registerTool(
-  "score_vocal_intelligibility",
-  {
-    title: "Score Vocal Intelligibility",
-    description: "Estimate vocal intelligibility and masking risk scaffold.",
-    inputSchema: { vocalTrackName: z.string().min(1).max(128) }
-  },
-  async ({ vocalTrackName }) =>
-    withMetrics("score_vocal_intelligibility", async () =>
-      textResult({
-        ok: true,
-        vocalTrackName,
-        score: 78,
-        risks: ["Possible 2-4kHz masking against synth lead"]
-      })
-    )
-);
-
-server.registerTool(
-  "plan_scene_energy_curve",
-  {
-    title: "Plan Scene Energy Curve",
-    description: "Plan scene energy trajectory.",
-    inputSchema: { scenes: z.array(z.number().int().min(0)).min(1) }
-  },
-  async ({ scenes }) =>
-    withMetrics("plan_scene_energy_curve", async () =>
-      textResult({
-        ok: true,
-        curve: scenes.map((s, i) => ({ sceneIndex: s, energy: Number((0.4 + i * (0.5 / scenes.length)).toFixed(3)) }))
-      })
-    )
+        settings: enabled ? ["Fast attack transient shaper", "Parallel comp blend 20-30%"] : ["Bypass punch chain"],
+        tracksTouched: targets.map((t) => ({ index: t.index, name: t.name })),
+        writesCount: writes.length,
+        dryRun: config.ABLETON_DRY_RUN
+      });
+    })
 );
 
 server.registerTool(
@@ -5930,305 +4005,6 @@ server.registerTool(
         source: latest.source ?? "unknown"
       });
     })
-);
-
-server.registerTool(
-  "manage_adaptive_sidechain",
-  {
-    title: "Manage Adaptive Sidechain",
-    description: "Adaptive sidechain strategy scaffold by section intensity.",
-    inputSchema: { sectionName: z.string().min(1).max(64), intensity: z.enum(["low", "medium", "high"]) }
-  },
-  async ({ sectionName, intensity }) =>
-    withMetrics("manage_adaptive_sidechain", async () =>
-      textResult({
-        ok: true,
-        sectionName,
-        intensity,
-        settings:
-          intensity === "high"
-            ? { amount: 0.8, release: 0.35 }
-            : intensity === "medium"
-              ? { amount: 0.6, release: 0.5 }
-              : { amount: 0.4, release: 0.65 }
-      })
-    )
-);
-
-server.registerTool(
-  "detect_automation_conflicts",
-  {
-    title: "Detect Automation Conflicts",
-    description: "Detect likely contradictory automation operations.",
-    inputSchema: {
-      operations: z
-        .array(
-          z.object({
-            target: z.string().min(1).max(128),
-            startBeats: z.number().min(0),
-            endBeats: z.number().gt(0),
-            intent: z.string().min(1).max(64)
-          })
-        )
-        .min(1)
-    }
-  },
-  async ({ operations }) =>
-    withMetrics("detect_automation_conflicts", async () => {
-      const conflicts = [];
-      for (let i = 0; i < operations.length; i += 1) {
-        for (let j = i + 1; j < operations.length; j += 1) {
-          const a = operations[i];
-          const b = operations[j];
-          if (a.target !== b.target) continue;
-          const overlap = Math.min(a.endBeats, b.endBeats) - Math.max(a.startBeats, b.startBeats);
-          if (overlap > 0 && a.intent !== b.intent) {
-            conflicts.push({ aIndex: i, bIndex: j, target: a.target, overlapBeats: Number(overlap.toFixed(3)) });
-          }
-        }
-      }
-      return textResult({ ok: true, conflicts, conflictCount: conflicts.length });
-    })
-);
-
-server.registerTool(
-  "set_device_parameter_lock_mode",
-  {
-    title: "Set Device Parameter Lock Mode",
-    description: "Lock/unlock critical device parameter writes by target key.",
-    inputSchema: {
-      targetKey: z.string().min(1).max(128),
-      locked: z.boolean()
-    }
-  },
-  async ({ targetKey, locked }) =>
-    withMetrics("set_device_parameter_lock_mode", async () => {
-      deviceParameterLocks.set(normalizeName(targetKey), {
-        targetKey,
-        locked,
-        updatedAt: new Date().toISOString()
-      });
-      await persistDeviceLocks();
-      return textResult({ ok: true, lock: deviceParameterLocks.get(normalizeName(targetKey)) });
-    })
-);
-
-server.registerTool(
-  "ear_training_prompt_mode",
-  {
-    title: "Ear Training Prompt Mode",
-    description: "Return targeted ear-training exercise from issue prompt.",
-    inputSchema: { issuePrompt: z.string().min(1).max(256) }
-  },
-  async ({ issuePrompt }) =>
-    withMetrics("ear_training_prompt_mode", async () =>
-      textResult({
-        ok: true,
-        issuePrompt,
-        exercise: "Sweep a narrow EQ band to locate problem frequency, then compare before/after cuts."
-      })
-    )
-);
-
-server.registerTool(
-  "monitor_session_drift",
-  {
-    title: "Monitor Session Drift",
-    description: "Assess drift from goal/style profile scaffold.",
-    inputSchema: { targetProfile: z.string().min(1).max(128) }
-  },
-  async ({ targetProfile }) =>
-    withMetrics("monitor_session_drift", async () =>
-      textResult({
-        ok: true,
-        targetProfile,
-        driftScore: 0.28,
-        note: "Low-moderate drift detected; suggest re-centering low-end and arrangement density."
-      })
-    )
-);
-
-server.registerTool(
-  "run_variant_consistency_audit",
-  {
-    title: "Run Variant Consistency Audit",
-    description: "Audit variant deliverables for naming/coverage consistency.",
-    inputSchema: {
-      expected: z
-        .array(z.enum(["master", "streaming", "stems", "instrumental", "acapella", "extended"]))
-        .optional()
-        .default(["master", "streaming", "stems"])
-    }
-  },
-  async ({ expected }) =>
-    withMetrics("run_variant_consistency_audit", async () => {
-      const completed = [...exportJobs.values()].filter((j) => j.status === "completed");
-      const targets = completed.map((j) => String(j.targetPath ?? "").toLowerCase());
-      const present = {
-        master: targets.some((t) => t.includes("master")),
-        streaming: targets.some((t) => t.includes("streaming")),
-        stems: targets.some((t) => t.includes("stems")),
-        instrumental: targets.some((t) => t.includes("instrumental")),
-        acapella: targets.some((t) => t.includes("acapella")),
-        extended: targets.some((t) => t.includes("extended"))
-      };
-      const missing = expected.filter((k) => !present[k]);
-      return textResult({ ok: missing.length === 0, expected, present, missing });
-    })
-);
-
-server.registerTool(
-  "simulate_mix_translation",
-  {
-    title: "Simulate Mix Translation",
-    description: "Heuristic mix translation diagnostics scaffold.",
-    inputSchema: { contexts: z.array(z.enum(["phone", "car", "club", "headphones"])).min(1) }
-  },
-  async ({ contexts }) =>
-    withMetrics("simulate_mix_translation", async () =>
-      textResult({
-        ok: true,
-        contexts,
-        observations: contexts.map((c) => ({
-          context: c,
-          note: c === "phone" ? "Check vocal mids and kick click audibility." : "Validate balance and transient control."
-        }))
-      })
-    )
-);
-
-server.registerTool(
-  "batch_song_operations",
-  {
-    title: "Batch Song Operations",
-    description: "Apply batch operation scaffold across setlist songs.",
-    inputSchema: {
-      operation: z.string().min(1).max(128),
-      songs: z.array(z.string().min(1).max(128)).min(1)
-    }
-  },
-  async ({ operation, songs }) =>
-    withMetrics("batch_song_operations", async () =>
-      textResult({
-        ok: true,
-        operation,
-        songs,
-        result: songs.map((s) => ({ song: s, status: "queued" }))
-      })
-    )
-);
-
-server.registerTool(
-  "package_client_revision",
-  {
-    title: "Package Client Revision",
-    description: "Generate client revision package summary scaffold.",
-    inputSchema: { revisionNote: z.string().max(500).optional() }
-  },
-  async ({ revisionNote }) =>
-    withMetrics("package_client_revision", async () =>
-      textResult({
-        ok: true,
-        revisionNote: revisionNote ?? null,
-        package: {
-          included: ["change-log", "deliverables-list", "qa-summary"],
-          generatedAt: new Date().toISOString()
-        }
-      })
-    )
-);
-
-server.registerTool(
-  "create_auto_rollback_policy",
-  {
-    title: "Create Auto Rollback Policy",
-    description: "Configure automatic rollback checkpoint policy.",
-    inputSchema: {
-      enabled: z.boolean(),
-      everyNCommands: z.number().int().min(1).max(500).optional().default(25),
-      everyNBars: z.number().int().min(1).max(256).optional().default(16),
-      categoryEveryN: z
-        .object({
-          arrangement: z.number().int().min(1).max(500).optional(),
-          device: z.number().int().min(1).max(500).optional(),
-          mixer: z.number().int().min(1).max(500).optional(),
-          transport: z.number().int().min(1).max(500).optional(),
-          export: z.number().int().min(1).max(500).optional(),
-          other: z.number().int().min(1).max(500).optional()
-        })
-        .optional()
-    }
-  },
-  async ({ enabled, everyNCommands, everyNBars, categoryEveryN }) =>
-    withMetrics("create_auto_rollback_policy", async () => {
-      rollbackPolicy.enabled = enabled;
-      rollbackPolicy.everyNCommands = everyNCommands;
-      rollbackPolicy.everyNBars = everyNBars;
-      if (categoryEveryN) {
-        rollbackPolicy.categoryEveryN = {
-          arrangement: Number(categoryEveryN.arrangement ?? rollbackPolicy.categoryEveryN.arrangement),
-          device: Number(categoryEveryN.device ?? rollbackPolicy.categoryEveryN.device),
-          mixer: Number(categoryEveryN.mixer ?? rollbackPolicy.categoryEveryN.mixer),
-          transport: Number(categoryEveryN.transport ?? rollbackPolicy.categoryEveryN.transport),
-          export: Number(categoryEveryN.export ?? rollbackPolicy.categoryEveryN.export),
-          other: Number(categoryEveryN.other ?? rollbackPolicy.categoryEveryN.other)
-        };
-      }
-      if (enabled) {
-        const sid = `auto_policy_${Date.now()}`;
-        const snap = await captureRollbackSnapshotInternal(sid, {
-          source: "auto-rollback-policy",
-          trigger: "policy-enable"
-        });
-        rollbackPolicy.lastSnapshotId = snap.snapshotId;
-      }
-      await persistRollbackPolicy();
-      return textResult({ ok: true, rollbackPolicy });
-    })
-);
-
-server.registerTool(
-  "upsert_reactive_rule",
-  {
-    title: "Upsert Reactive Rule",
-    description: "Save a reactive automation rule for real-time trigger scaffolding.",
-    inputSchema: {
-      ruleName: z.string().min(1).max(128),
-      trigger: z.string().min(1).max(128),
-      action: z.string().min(1).max(128),
-      enabled: z.boolean().optional().default(true)
-    }
-  },
-  async ({ ruleName, trigger, action, enabled }) =>
-    withMetrics("upsert_reactive_rule", async () => {
-      reactiveRules.set(normalizeName(ruleName), {
-        ruleName,
-        trigger,
-        action,
-        enabled,
-        updatedAt: new Date().toISOString()
-      });
-      return textResult({ ok: true, rule: reactiveRules.get(normalizeName(ruleName)) });
-    })
-);
-
-server.registerTool(
-  "list_reactive_rules",
-  { title: "List Reactive Rules", description: "List saved reactive rules." },
-  async () => withMetrics("list_reactive_rules", async () => textResult({ rules: Object.fromEntries(reactiveRules) }))
-);
-
-server.registerTool(
-  "run_gain_staging_autopilot",
-  {
-    title: "Run Gain Staging Autopilot",
-    description: "Set sampled track levels toward target engineering headroom.",
-    inputSchema: {
-      sampleTracks: z.number().int().min(1).max(64).optional().default(16),
-      target: z.number().min(0.5).max(0.9).optional().default(0.75)
-    }
-  },
-  async ({ sampleTracks, target }) => withMetrics("run_gain_staging_autopilot", async () => textResult(await autoGainStage(sampleTracks, target)))
 );
 
 async function autoGainStage(sampleTracks, target) {
@@ -6309,73 +4085,15 @@ server.registerTool(
 );
 
 server.registerTool(
-  "manage_dynamic_range",
-  {
-    title: "Manage Dynamic Range",
-    description: "Recommend dynamic control strategy per source type.",
-    inputSchema: { sourceType: z.enum(["drums", "bass", "vocal", "music-bus", "master"]) }
-  },
-  async ({ sourceType }) =>
-    withMetrics("manage_dynamic_range", async () =>
-      textResult({
-        ok: true,
-        sourceType,
-        strategy:
-          sourceType === "vocal"
-            ? "Serial compression: gentle leveling + peak control."
-            : sourceType === "drums"
-              ? "Parallel compression with transient-preserving dry blend."
-              : "Moderate bus compression with gain-matched A/B checks."
-      })
-    )
-);
-
-server.registerTool(
-  "detect_sibilance_harshness",
-  {
-    title: "Detect Sibilance Harshness",
-    description: "Return likely harsh bands and de-essing guidance.",
-    inputSchema: { trackName: z.string().min(1).max(128) }
-  },
-  async ({ trackName }) =>
-    withMetrics("detect_sibilance_harshness", async () =>
-      textResult({ ok: true, trackName, bands: ["5-8kHz sibilance", "2-4kHz harshness"], suggestion: "Use split-band de-esser + dynamic EQ." })
-    )
-);
-
-server.registerTool(
-  "run_low_end_control_suite",
-  {
-    title: "Run Low End Control Suite",
-    description: "Low-end mono/hand-off diagnostics and suggestions.",
-    inputSchema: {
-      applyCorrections: z.boolean().optional().default(false),
-      kickTrackName: z.string().max(128).optional(),
-      bassTrackName: z.string().max(128).optional()
-    }
-  },
-  async ({ applyCorrections, kickTrackName, bassTrackName }) =>
-    withMetrics("run_low_end_control_suite", async () => {
-      const checks = ["Mono below 120Hz", "Kick-bass frequency handoff", "Sub headroom margin before limiter"];
-      let correction = null;
-      if (applyCorrections && kickTrackName && bassTrackName) {
-        correction = await withMetrics("resolve_kick_bass_conflict", async () =>
-          textResult({ delegated: true, kickTrackName, bassTrackName })
-        );
-      }
-      return textResult({ ok: true, checks, applyCorrections, correction });
-    })
-);
-
-server.registerTool(
   "optimize_bus_compression",
   {
     title: "Optimize Bus Compression",
-    description: "Tune bus compression settings scaffold by genre intent.",
+    description:
+      "Tune bus compression settings by genre intent. applyWrites defaults true (sends proxy device parameter OSC on matching tracks). Set applyWrites=false for recommendations only. Skips master bus.",
     inputSchema: {
       bus: z.enum(["drum", "music", "vocal", "master"]),
       style: z.string().min(1).max(64).optional().default("neutral"),
-      applyWrites: z.boolean().optional().default(false)
+      applyWrites: z.boolean().optional().default(true)
     }
   },
   async ({ bus, style, applyWrites }) =>
@@ -6409,24 +4127,12 @@ server.registerTool(
 );
 
 server.registerTool(
-  "run_transient_shaping_assistant",
-  {
-    title: "Run Transient Shaping Assistant",
-    description: "Recommend transient attack/sustain moves.",
-    inputSchema: { target: z.string().min(1).max(128) }
-  },
-  async ({ target }) =>
-    withMetrics("run_transient_shaping_assistant", async () =>
-      textResult({ ok: true, target, recipe: ["Boost attack slightly", "Trim sustain for clarity", "Re-check peak headroom"] })
-    )
-);
-
-server.registerTool(
   "run_stereo_image_optimizer",
   {
     title: "Run Stereo Image Optimizer",
-    description: "Stereo width and mono compatibility optimization scaffold.",
-    inputSchema: { applyWrites: z.boolean().optional().default(false) }
+    description:
+      "Stereo width and mono compatibility. applyWrites defaults true (narrows extreme pans via OSC). Set false for diagnostics only.",
+    inputSchema: { applyWrites: z.boolean().optional().default(true) }
   },
   async ({ applyWrites }) =>
     withMetrics("run_stereo_image_optimizer", async () => {
@@ -6456,75 +4162,6 @@ server.registerTool(
         sampled,
         applyWrites,
         writes
-      });
-    })
-);
-
-server.registerTool(
-  "manage_reverb_delay_space",
-  {
-    title: "Manage Reverb Delay Space",
-    description: "Prevent space wash and overlap through send strategy.",
-    inputSchema: { profile: z.enum(["tight", "balanced", "wide"]).optional().default("balanced") }
-  },
-  async ({ profile }) =>
-    withMetrics("manage_reverb_delay_space", async () =>
-      textResult({
-        ok: true,
-        profile,
-        guidance:
-          profile === "tight"
-            ? "Short decays, longer pre-delay, lower return level."
-            : profile === "wide"
-              ? "Longer tails with ducking and filtered returns."
-              : "Balanced decay with tempo-synced delays."
-      })
-    )
-);
-
-server.registerTool(
-  "run_automation_quality_check",
-  {
-    title: "Run Automation Quality Check",
-    description: "Detect abrupt/overdense automation patterns from provided points.",
-    inputSchema: {
-      points: z
-        .array(
-          z.object({
-            beat: z.number().min(0),
-            value: z.number().min(0).max(1)
-          })
-        )
-        .min(2)
-    }
-  },
-  async ({ points }) =>
-    withMetrics("run_automation_quality_check", async () => {
-      let abrupt = 0;
-      for (let i = 1; i < points.length; i += 1) {
-        if (Math.abs(points[i].value - points[i - 1].value) > 0.5) abrupt += 1;
-      }
-      return textResult({ ok: true, pointCount: points.length, abruptTransitions: abrupt, suggestion: abrupt > 0 ? "Smooth with intermediate points." : "Automation looks stable." });
-    })
-);
-
-server.registerTool(
-  "run_reference_match_engine",
-  {
-    title: "Run Reference Match Engine",
-    description: "Reference tonal/dynamics/stereo targeting scaffold.",
-    inputSchema: { referenceName: z.string().min(1).max(128) }
-  },
-  async ({ referenceName }) =>
-    withMetrics("run_reference_match_engine", async () => {
-      const readiness = await withMetrics("run_release_readiness_score", async () =>
-        textResult({ delegated: true })
-      );
-      return textResult({
-        ok: true,
-        referenceName,
-        targets: ["Tonal tilt alignment", "Dynamics envelope similarity", "Stereo width profile check"],
-        readiness
       });
     })
 );
@@ -6567,27 +4204,6 @@ server.registerTool(
         contexts,
         trackCount: tracks.trackCount,
         notes: contexts.map((c) => (c === "phone" ? "Prioritize vocal mids and kick click." : `Check balance for ${c}.`))
-      });
-    })
-);
-
-server.registerTool(
-  "run_stem_quality_auditor",
-  {
-    title: "Run Stem Quality Auditor",
-    description: "Audit stems for consistency and readiness.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("run_stem_quality_auditor", async () => {
-      const completed = [...exportJobs.values()].filter((j) => j.status === "completed");
-      const targets = completed.map((j) => String(j.targetPath ?? "").toLowerCase());
-      return textResult({
-        ok: completed.length > 0,
-        completedJobs: completed.length,
-        checks: ["Length consistency", "Loudness spread sanity", "Naming conventions"],
-        hasMaster: targets.some((t) => t.includes("master")),
-        hasStems: targets.some((t) => t.includes("stems"))
       });
     })
 );
@@ -6663,106 +4279,6 @@ server.registerTool(
               : ["mix: dynamic-first", "pre-master according to standard"]
       });
     })
-);
-
-server.registerTool(
-  "analyze_revision_delta",
-  {
-    title: "Analyze Revision Delta",
-    description: "Summarize sonic/operational delta between recent revisions.",
-    inputSchema: { notes: z.string().max(500).optional() }
-  },
-  async ({ notes }) =>
-    withMetrics("analyze_revision_delta", async () =>
-      textResult({
-        ok: true,
-        notes: notes ?? null,
-        delta: {
-          commandDelta: metrics.totalCommands,
-          recentFailures: metrics.failedCommands,
-          completedExports: [...exportJobs.values()].filter((j) => j.status === "completed").length,
-          suggestion: "Compare export QA summaries between revisions."
-        }
-      })
-    )
-);
-
-server.registerTool(
-  "run_engineering_checklist_mode",
-  {
-    title: "Run Engineering Checklist Mode",
-    description: "Return pre-mix / pre-master / pre-export checklist with scoring.",
-    inputSchema: { stage: z.enum(["pre-mix", "pre-master", "pre-export"]) }
-  },
-  async ({ stage }) =>
-    withMetrics("run_engineering_checklist_mode", async () => {
-      const checks =
-        stage === "pre-mix"
-          ? ["Gain staging done", "Phase check done", "Masking analysis reviewed"]
-          : stage === "pre-master"
-            ? ["Bus glue checked", "Stereo/mono check passed", "Headroom margin verified"]
-            : ["Variant matrix complete", "Post-export QA pass", "Naming normalized"];
-      const base = stage === "pre-export" ? 75 : stage === "pre-master" ? 80 : 85;
-      const penalty = Math.min(20, metrics.failedCommands);
-      const score = Math.max(0, base - penalty);
-      return textResult({ ok: score >= 70, stage, checklist: checks, score, failedCommands: metrics.failedCommands });
-    })
-);
-
-server.registerTool(
-  "plan_integrated_loudness_meter_path",
-  {
-    title: "Plan Integrated Loudness Meter Path",
-    description:
-      "Return a staged loudness metering workflow (momentary/short-term/integrated) aligned to a delivery target.",
-    inputSchema: {
-      destination: z.enum(["streaming", "broadcast", "club", "film"]).optional().default("streaming")
-    }
-  },
-  async ({ destination }) =>
-    withMetrics("plan_integrated_loudness_meter_path", async () => {
-      const meterChain =
-        destination === "streaming"
-          ? ["Pre-fader clip meters", "Bus short-term meters", "Master integrated + true-peak post-limiter"]
-          : destination === "club"
-            ? ["Kick/bass crest meters", "Master peak + sustained RMS", "Limiter reduction meter"]
-            : ["Dialog-weighted bus", "Integrated program loudness", "True-peak guard post-chain"];
-      return textResult({
-        ok: true,
-        destination,
-        meterChain,
-        practice:
-          "Match meter tap points to decision stage: balance at pre-master bus, final compliance at post-limiter.",
-        sessionMode: advancedEngineeringState.sessionMode
-      });
-    })
-);
-
-server.registerTool(
-  "configure_true_peak_guardrails",
-  {
-    title: "Configure True-Peak Guardrails",
-    description:
-      "Recommend inter-sample peak (ISP) ceiling, limiter staging, and oversampling policy for the master chain.",
-    inputSchema: {
-      ceilingDbTp: z.number().min(-3).max(0).optional().default(-1),
-      oversamplingHint: z.enum(["off", "2x", "4x", "8x"]).optional().default("4x")
-    }
-  },
-  async ({ ceilingDbTp, oversamplingHint }) =>
-    withMetrics("configure_true_peak_guardrails", async () =>
-      textResult({
-        ok: true,
-        ceilingDbTp,
-        oversamplingHint,
-        guardrails: [
-          `Keep ceiling at or below ${ceilingDbTp} dBTP on the final limiter.`,
-          "Place ISP-aware metering after the last gain stage that can create peaks.",
-          `Prefer ${oversamplingHint} on the limiter while printing masters; disable for real-time monitoring if CPU-bound.`,
-          "Add 0.5–1.5 dB headroom before limiting if upstream clipping or soft-clipping is used."
-        ]
-      })
-    )
 );
 
 server.registerTool(
@@ -6863,42 +4379,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "enable_solo_safe_diagnostic_mode",
-  {
-    title: "Enable Solo-Safe Diagnostic Mode",
-    description:
-      "Capture rollback snapshot before solo-heavy diagnostics; disable restores intent flag (Live solo state not auto-restored).",
-    inputSchema: { action: z.enum(["enable", "disable", "status"]).optional().default("status") }
-  },
-  async ({ action }) =>
-    withMetrics("enable_solo_safe_diagnostic_mode", async () => {
-      if (action === "status") {
-        return textResult({ ok: true, soloSafe: advancedEngineeringState.soloSafe });
-      }
-      if (action === "disable") {
-        advancedEngineeringState.soloSafe.enabled = false;
-        return textResult({ ok: true, soloSafe: advancedEngineeringState.soloSafe, message: "Solo-safe flag cleared." });
-      }
-      const snapshotId = `solo_safe_${Date.now()}_${randomUUID().slice(0, 8)}`;
-      const snap = await captureRollbackSnapshotInternal(snapshotId, {
-        source: "solo-safe-diagnostic",
-        trigger: "pre-solo-workflow"
-      });
-      advancedEngineeringState.soloSafe = {
-        enabled: true,
-        snapshotId: snap.snapshotId,
-        startedAt: snap.capturedAt
-      };
-      return textResult({
-        ok: true,
-        soloSafe: advancedEngineeringState.soloSafe,
-        snapshot: snap,
-        hint: "Restore mixer intent via snapshot reverse hints or manual undo; verify solo/mute after diagnostics."
-      });
-    })
-);
-
-server.registerTool(
   "monitor_correlation_mono_sum",
   {
     title: "Monitor Correlation / Mono Sum",
@@ -6943,31 +4423,6 @@ server.registerTool(
         rows,
         guidance:
           "Wide-panned hot elements can lose energy in mono; check mono sum on master and correlate low end below ~120 Hz."
-      });
-    })
-);
-
-server.registerTool(
-  "plan_multiband_dynamics_chain",
-  {
-    title: "Plan Multiband Dynamics Chain",
-    description: "Suggest multiband compression/ducking order for a bus role.",
-    inputSchema: { bus: z.enum(["drum", "music", "vocal", "master"]) }
-  },
-  async ({ bus }) =>
-    withMetrics("plan_multiband_dynamics_chain", async () => {
-      const bands =
-        bus === "vocal"
-          ? ["Low: rumble control", "Mid: presence leveling", "High: de-ess / air cap"]
-          : bus === "drum"
-            ? ["Sub: gentle control", "Low-mid: ring control", "High: transient-aware limiting"]
-            : ["Low: foundation glue", "Mid: masking control", "High: peak polish"];
-      return textResult({
-        ok: true,
-        bus,
-        bands,
-        order: ["Linear-phase split (optional)", "Low band compressor", "Mid band compressor", "High band limiter/clip"],
-        sessionMode: advancedEngineeringState.sessionMode
       });
     })
 );
@@ -7033,36 +4488,6 @@ server.registerTool(
         ]
       });
     })
-);
-
-server.registerTool(
-  "suggest_parallel_processing_recipes",
-  {
-    title: "Suggest Parallel Processing Recipes",
-    description: "Parallel compression / saturation / width recipes with wet/dry starting points.",
-    inputSchema: { flavor: z.enum(["punch", "glue", "air", "lofi"]).optional().default("glue") }
-  },
-  async ({ flavor }) =>
-    withMetrics("suggest_parallel_processing_recipes", async () =>
-      textResult({
-        ok: true,
-        flavor,
-        recipes: [
-          {
-            name: `${flavor}-parallel-comp`,
-            sendLevel: flavor === "punch" ? -12 : -18,
-            wetDry: flavor === "glue" ? "35/65" : "25/75",
-            chain: ["EQ HPF 80 Hz", "Medium attack comp", "Optional soft clip"]
-          },
-          {
-            name: `${flavor}-parallel-sat`,
-            sendLevel: -20,
-            wetDry: "15/85",
-            chain: ["Tape/saturation", "Band-limit 12 kHz", "Blend to taste"]
-          }
-        ]
-      })
-    )
 );
 
 server.registerTool(
@@ -7184,125 +4609,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "apply_translation_presets",
-  {
-    title: "Apply Translation Presets",
-    description: "EQ/balance translation preset suggestions for car, phone, and laptop playback.",
-    inputSchema: { preset: z.enum(["car", "phone", "laptop", "club"]) }
-  },
-  async ({ preset }) =>
-    withMetrics("apply_translation_presets", async () =>
-      textResult({
-        ok: true,
-        preset,
-        suggestions:
-          preset === "car"
-            ? ["High-pass master gently at 25–30 Hz", "Tame 300–500 Hz mud +2 dB presence 2.5 kHz"]
-            : preset === "phone"
-              ? ["Mono-sum check; boost 2–4 kHz intelligibility lightly", "Control sub energy; verify fundamental on small speaker"]
-              : preset === "laptop"
-                ? ["Shelf air carefully; avoid hiss", "Kick beater click 2–4 kHz for audibility"]
-                : ["Controlled subs; limit LF buildup in verb returns"]
-      })
-    )
-);
-
-server.registerTool(
-  "build_headphone_translation_profile",
-  {
-    title: "Build Headphone Translation Profile",
-    description: "Headphone-specific crossfeed and bass-to-mids compensation scaffold.",
-    inputSchema: { headphoneModel: z.string().min(1).max(128) }
-  },
-  async ({ headphoneModel }) =>
-    withMetrics("build_headphone_translation_profile", async () =>
-      textResult({
-        ok: true,
-        headphoneModel,
-        profile: {
-          crossfeedMs: 0.35,
-          crossfeedDb: -12,
-          bassShelfHz: 120,
-          bassShelfDb: -1.2,
-          note: "Tune crossfeed and shelf by A/B against trusted nearfields; store as Live rack preset."
-        }
-      })
-    )
-);
-
-server.registerTool(
-  "lock_master_chain_delta",
-  {
-    title: "Lock Master Chain Delta",
-    description: "Capture or verify master-side mixer levels (tail tracks) for before/after comparisons.",
-    inputSchema: { action: z.enum(["capture", "verify", "release", "status"]).optional().default("status") }
-  },
-  async ({ action }) =>
-    withMetrics("lock_master_chain_delta", async () => {
-      if (action === "status") {
-        return textResult({ ok: true, state: advancedEngineeringState.masterChainDelta });
-      }
-      if (action === "release") {
-        advancedEngineeringState.masterChainDelta = { locked: false, baseline: null, baselineAt: null };
-        return textResult({ ok: true, released: true });
-      }
-      if (action === "capture") {
-        const baseline = await sampleMasterChainMixerRows(6);
-        advancedEngineeringState.masterChainDelta = {
-          locked: true,
-          baseline,
-          baselineAt: new Date().toISOString()
-        };
-        return textResult({ ok: true, captured: advancedEngineeringState.masterChainDelta });
-      }
-      const { baseline, baselineAt } = advancedEngineeringState.masterChainDelta;
-      if (!baseline) {
-        return textResult({ ok: false, error: "No baseline; run action capture first." });
-      }
-      const current = await sampleMasterChainMixerRows(6);
-      const tol = 0.03;
-      const diffs = [];
-      for (let i = 0; i < baseline.length; i++) {
-        const a = baseline[i];
-        const b = current[i];
-        if (a && b && a.volume != null && b.volume != null) {
-          const d = Math.abs(a.volume - b.volume);
-          if (d > tol) diffs.push({ name: a.name, delta: Number(d.toFixed(4)) });
-        }
-      }
-      return textResult({
-        ok: diffs.length === 0,
-        baselineAt,
-        diffs,
-        message: diffs.length ? "Mixer drift detected on tail tracks; gain-match before judging tonal changes." : "Levels match baseline within tolerance."
-      });
-    })
-);
-
-server.registerTool(
-  "plan_stem_loudness_normalization",
-  {
-    title: "Plan Stem Loudness Normalization",
-    description: "Normalization plan for stem batch so masters re-combine predictably.",
-    inputSchema: { targetIntegratedLufs: z.number().min(-24).max(-6).optional().default(-14) }
-  },
-  async ({ targetIntegratedLufs }) =>
-    withMetrics("plan_stem_loudness_normalization", async () => {
-      const jobs = [...exportJobs.values()].filter((j) => j.status === "completed");
-      return textResult({
-        ok: true,
-        targetIntegratedLufs,
-        completedExports: jobs.length,
-        plan: [
-          "Normalize each stem to target integrated with true-peak ceiling -1 dBTP.",
-          "Print stems with identical limiter template for tonal consistency.",
-          "Verify sum of stems ≈ master within 0.5 dB after normalization."
-        ]
-      });
-    })
-);
-
-server.registerTool(
   "generate_dynamic_range_report",
   {
     title: "Generate Dynamic Range Report",
@@ -7338,131 +4644,6 @@ server.registerTool(
             : "Levels clustered; check that dynamics are intentional not over-compressed masking."
       });
     })
-);
-
-server.registerTool(
-  "build_client_revision_ab_pack",
-  {
-    title: "Build Client Revision A/B Pack",
-    description: "Checklist and naming pattern for client-facing A/B between revisions.",
-    inputSchema: {
-      revisionA: z.string().min(1).max(64),
-      revisionB: z.string().min(1).max(64)
-    }
-  },
-  async ({ revisionA, revisionB }) =>
-    withMetrics("build_client_revision_ab_pack", async () =>
-      textResult({
-        ok: true,
-        revisionA,
-        revisionB,
-        pack: {
-          fileNaming: [`${revisionA}_master.wav`, `${revisionB}_master.wav`],
-          loudnessNote: "Match integrated loudness within 0.3 LU for fair A/B.",
-          emailBlurb: "Two candidates attached; same start/end trim; level-matched for comparison."
-        }
-      })
-    )
-);
-
-server.registerTool(
-  "set_engineering_session_mode",
-  {
-    title: "Set Engineering Session Mode",
-    description: "Tune assistant aggressiveness for QA vs minimal-touch workflows.",
-    inputSchema: { mode: z.enum(["balanced", "aggressive_qa", "minimal_touch"]) }
-  },
-  async ({ mode }) =>
-    withMetrics("set_engineering_session_mode", async () => {
-      advancedEngineeringState.sessionMode = mode;
-      return textResult({
-        ok: true,
-        mode,
-        effect:
-          mode === "aggressive_qa"
-            ? "Prefer extra checkpoints, snapshots, and stricter drift warnings."
-            : mode === "minimal_touch"
-              ? "Bias toward read-only diagnostics and fewer automatic write suggestions."
-              : "Default mix of diagnostics and actionable writes."
-      });
-    })
-);
-
-server.registerTool(
-  "append_change_attribution_log",
-  {
-    title: "Append Change Attribution Log",
-    description: "Record who changed what for engineering audits (in-memory ring buffer).",
-    inputSchema: {
-      actor: z.string().min(1).max(64),
-      action: z.string().min(1).max(128),
-      detail: z.string().max(500).optional(),
-      trackHint: z.string().max(128).optional()
-    }
-  },
-  async ({ actor, action, detail, trackHint }) =>
-    withMetrics("append_change_attribution_log", async () => {
-      pushChangeAttribution({ actor, action, detail, trackHint });
-      return textResult({
-        ok: true,
-        tail: advancedEngineeringState.changeLog.slice(-5)
-      });
-    })
-);
-
-server.registerTool(
-  "run_blind_ab_helper",
-  {
-    title: "Run Blind A/B Helper",
-    description: "Shuffle variants to anonymous play order for unbiased listening tests.",
-    inputSchema: { variants: z.array(z.string().min(1).max(128)).min(2).max(8) }
-  },
-  async ({ variants }) =>
-    withMetrics("run_blind_ab_helper", async () => {
-      const order = variants.map((label, sourceIndex) => ({ label, sourceIndex }));
-      for (let i = order.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [order[i], order[j]] = [order[j], order[i]];
-      }
-      const sessionId = randomUUID();
-      const assignments = order.map((entry, playOrder) => ({
-        playOrder: playOrder + 1,
-        anonymousId: `listen_${playOrder + 1}`,
-        sourceIndex: entry.sourceIndex,
-        resolvedLabel: entry.label
-      }));
-      advancedEngineeringState.blindAb = { sessionId, assignments, createdAt: new Date().toISOString(), variantLabels: variants };
-      return textResult({
-        ok: true,
-        sessionId,
-        assignments,
-        instruction: "Do not open file names that reveal mix identity until votes are collected; use anonymousId when exporting."
-      });
-    })
-);
-
-server.registerTool(
-  "plan_vocal_take_ladder",
-  {
-    title: "Plan Vocal Take Ladder",
-    description:
-      "Naming and keeper-marking workflow for vocal takes in Live. Plugins: none (built-in take lanes / comping). Optional: Waves Vocal Rider or iZotope Neutron for level-matched takes before comping.",
-    inputSchema: { baseName: z.string().min(1).max(64).optional().default("Vox") }
-  },
-  async ({ baseName }) =>
-    withMetrics("plan_vocal_take_ladder", async () =>
-      textResult({
-        ok: true,
-        baseName,
-        pluginsRequired: [],
-        pluginsOptional: ["Waves Vocal Rider", "iZotope Neutron"],
-        namingPattern: [`${baseName}_T01`, `${baseName}_T02`, `${baseName}_HOOK_KEEP`, `${baseName}_ADLIB`],
-        steps: [
-          "Color-code keepers vs rejects; freeze FX on archived takes to save CPU.",
-          "Bounce a safety 'all-takes' stem before destructive comping."
-        ]
-      })
-    )
 );
 
 server.registerTool(
@@ -7533,66 +4714,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "run_vocal_room_tone_headphone_checklist",
-  {
-    title: "Run Vocal Room Tone / Headphone Bleed Checklist",
-    description:
-      "Recording hygiene checklist before serious vocals. Repair plugins: iZotope RX Spectral Repair / Dialogue Isolate; bleed: RX Music Rebalance (if licensed). Optional room: SPL De-Verb or Acon Digital DeVerberate.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("run_vocal_room_tone_headphone_checklist", async () =>
-      textResult({
-        ok: true,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "iZotope RX (Spectral Repair, Dialogue Isolate, Music Rebalance)",
-          "SPL De-Verb",
-          "Acon Digital DeVerberate"
-        ],
-        checklist: [
-          "Record 10s silence in place for room tone.",
-          "Mark headphone level; reduce click track bleed.",
-          "Note AC/fridge; schedule pause or edit plan."
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "run_vocal_comp_workflow_v2",
-  {
-    title: "Run Vocal Comp Workflow v2",
-    description:
-      "Phrase-level comp map and crossfade guidance. Pitch-aware comp: Celemony Melodyne (ARA in Live where supported) or Synchro Arts VocAlign / RePitch. Time alignment: VocAlign Ultra / Revoice Pro.",
-    inputSchema: {
-      trackName: z.string().min(1).max(128),
-      crossfadeMs: z.number().min(5).max(80).optional().default(22)
-    }
-  },
-  async ({ trackName, crossfadeMs }) =>
-    withMetrics("run_vocal_comp_workflow_v2", async () =>
-      textResult({
-        ok: true,
-        trackName,
-        crossfadeMs,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Celemony Melodyne",
-          "Synchro Arts VocAlign 6 / Ultra",
-          "Synchro Arts RePitch",
-          "Revoice Pro"
-        ],
-        workflow: [
-          "Comp consonants from the brightest take; vowels from the most stable.",
-          "Split at breaths; avoid mid-word unless timing matched.",
-          `Default crossfade ~${crossfadeMs}ms; shorten on percussive consonants.`
-        ]
-      })
-    )
-);
-
-server.registerTool(
   "analyze_vocal_take_consistency",
   {
     title: "Analyze Vocal Take Consistency",
@@ -7629,61 +4750,6 @@ server.registerTool(
             : "Takes are roughly level-matched by fader proxy."
       });
     })
-);
-
-server.registerTool(
-  "plan_vocal_tuning_strategy",
-  {
-    title: "Plan Vocal Tuning Strategy",
-    description:
-      "When to use transparent vs creative tuning. Plugins named for user shopping: Antares Auto-Tune Pro, Celemony Melodyne 5, Waves Tune Real-Time / Waves Tune, Soundtoys Little AlterBoy, stock Ableton Pitch devices. Print vs live monitoring called out in output.",
-    inputSchema: { style: z.enum(["transparent", "modern-pop", "character"]).optional().default("transparent") }
-  },
-  async ({ style }) =>
-    withMetrics("plan_vocal_tuning_strategy", async () =>
-      textResult({
-        ok: true,
-        style,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Antares Auto-Tune Pro",
-          "Celemony Melodyne 5",
-          "Waves Tune Real-Time",
-          "Waves Tune",
-          "Soundtoys Little AlterBoy",
-          "Ableton Pitch Shifter / Corpus (stock creative)"
-        ],
-        strategy:
-          style === "modern-pop"
-            ? "Fast retune + scale lock; print with low latency plugin on monitoring path only."
-            : style === "character"
-              ? "Formant-shift and parallel detune; watch consonant smear."
-              : "Melodyne-style manual edits per phrase; avoid over-smoothing breath noise."
-      })
-    )
-);
-
-server.registerTool(
-  "plan_vocal_timing_tighten",
-  {
-    title: "Plan Vocal Timing Tighten",
-    description:
-      "Nudge vs quantize plan for vocals. Plugins: Synchro Arts VocAlign Ultra / Revoice Pro for dub alignment; stock Ableton Warp for single vocal. Elastic Audio in Pro Tools is out of scope for this Live bridge.",
-    inputSchema: { aggressiveness: z.enum(["light", "medium", "tight"]).optional().default("medium") }
-  },
-  async ({ aggressiveness }) =>
-    withMetrics("plan_vocal_timing_tighten", async () =>
-      textResult({
-        ok: true,
-        aggressiveness,
-        pluginsRequired: [],
-        pluginsOptional: ["Synchro Arts VocAlign Ultra", "Revoice Pro", "Ableton Warp (stock)"],
-        plan: [
-          "Tighten doubles to lead first; then nudge lead ±5–15 ms before hard quantize.",
-          "Preserve pick-ups and ad-libs as human markers unless EDM grid demands."
-        ]
-      })
-    )
 );
 
 server.registerTool(
@@ -7726,49 +4792,6 @@ server.registerTool(
         sends: ["Single short room send shared by doubles; pre-delay 25–40 ms."]
       });
     })
-);
-
-server.registerTool(
-  "plan_singer_plugin_chain",
-  {
-    title: "Plan Singer Plugin Chain",
-    description:
-      "Ordered vocal chain with explicit third-party options. Tell the user they need their chosen stack installed: FabFilter Pro-Q 3 / Pro-C 2 / Pro-DS / Pro-L 2, Waves SSL E-Channel / RVox / Renaissance DeEsser / CLA Vocals, UAD LA-2A / 1176, iZotope Nectar 4, oeksound Soothe2 / Spiff, Sonnox Oxford SuprEsser, Soundtoys Decapitator / Little Plate — or stock EQ Eight + Compressor + Utility.",
-    inputSchema: { genre: z.enum(["pop", "rnb", "rock", "podcast"]).optional().default("pop") }
-  },
-  async ({ genre }) =>
-    withMetrics("plan_singer_plugin_chain", async () =>
-      textResult({
-        ok: true,
-        genre,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "FabFilter Pro-Q 3",
-          "FabFilter Pro-C 2",
-          "FabFilter Pro-DS",
-          "FabFilter Pro-L 2",
-          "Waves SSL E-Channel",
-          "Waves RVox",
-          "Waves Renaissance DeEsser",
-          "Waves CLA Vocals",
-          "UAD Teletronix LA-2A",
-          "UAD 1176LN",
-          "iZotope Nectar 4",
-          "oeksound Soothe2",
-          "oeksound Spiff",
-          "Sonnox Oxford SuprEsser",
-          "Soundtoys Decapitator",
-          "Soundtoys Little Plate",
-          "Ableton EQ Eight / Compressor / Utility (stock)"
-        ],
-        chainOrder:
-          genre === "podcast"
-            ? ["HPF", "De-ess", "Gentle comp", "Air shelf", "Limiter"]
-            : ["HPF", "Subtractive EQ", "Serial comp", "De-ess", "Additive EQ", "Spatial/send", "Limiter"],
-        userMessage:
-          "Install only the plugins you pick from pluginsOptional; none are strictly required if you use the stock Ableton devices instead."
-      })
-    )
 );
 
 server.registerTool(
@@ -7842,15 +4865,16 @@ server.registerTool(
   {
     title: "Generate Vocal Harmony MIDI Scaffold",
     description:
-      "Triad MIDI block scaffold on a clip for harmony practice. Chord helper plugins (optional): Plugin Boutique Scaler 2, Mixed In Key Captain Chords, Orb Producer Suite. Pitch correction on audio: Melodyne / Auto-Tune — not inserted by this tool.",
+      "Triad MIDI block on a clip for harmony practice. Defaults: applyMidi=true and createClipFirst=true (writes to Live). Set applyMidi=false for preview only. Plugins (optional): Scaler 2, Captain Chords, Orb Producer Suite.",
     inputSchema: {
       trackName: z.string().min(1).max(128),
       clipIndex: z.number().int().min(0).optional().default(0),
       rootMidi: z.number().int().min(36).max(84).optional().default(60),
-      applyMidi: z.boolean().optional().default(false)
+      applyMidi: z.boolean().optional().default(true),
+      createClipFirst: z.boolean().optional().default(true)
     }
   },
-  async ({ trackName, clipIndex, rootMidi, applyMidi }) =>
+  async ({ trackName, clipIndex, rootMidi, applyMidi, createClipFirst }) =>
     withMetrics("generate_vocal_harmony_midi_scaffold", async () => {
       const resolved = await resolveTrackIndexFromName(trackName, 0.45);
       const third = rootMidi + 4;
@@ -7861,6 +4885,16 @@ server.registerTool(
         { pitch: fifth, start: 0, duration: 1, velocity: 85, mute: false }
       ];
       let writeCount = 0;
+      const clipCreates = [];
+      if (applyMidi && createClipFirst) {
+        clipCreates.push(
+          sendMaybe("/live/clip_slot/create_clip", [
+            intArg(resolved.index),
+            intArg(clipIndex),
+            floatArg(4)
+          ])
+        );
+      }
       if (applyMidi) {
         for (const note of notes) {
           sendMaybe("/live/clip/add_note", [
@@ -7881,10 +4915,13 @@ server.registerTool(
         clipIndex,
         notes,
         applyMidi,
+        createClipFirst,
         notesWritten: writeCount,
+        clipSlotCreates: clipCreates.length,
         pluginsRequired: [],
         pluginsOptional: ["Plugin Boutique Scaler 2", "Mixed In Key Captain Chords", "Orb Producer Suite"],
-        hint: "Set applyMidi=true to best-effort add notes; clip must exist and endpoint must support add_note."
+        hint: "Set applyMidi=false for JSON-only. createClipFirst=false if the clip slot already has a clip.",
+        ...(applyMidi ? sessionClipPlacementHint(resolved.index, clipIndex) : {})
       });
     })
 );
@@ -8001,236 +5038,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "run_vocal_ear_training_checklist",
-  {
-    title: "Run Vocal Ear Training Checklist",
-    description:
-      "Bias-aware listening drills for intonation and tone (no auto scoring). Plugins: none. Optional reference pitch: Korg CA-type tuner plugin or Melodyne for visual pitch education only.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("run_vocal_ear_training_checklist", async () =>
-      textResult({
-        ok: true,
-        pluginsRequired: [],
-        pluginsOptional: ["Celemony Melodyne (visual education)", "Hardware/software tuner VST"],
-        drills: [
-          "Sing a major scale against a drone; check third and seventh tuning by ear.",
-          "Record same phrase flat 10 cents then in tune; blind A/B yourself.",
-          "Compare vowel shape on ee vs ah at same pitch."
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "manage_vocal_fx_snapshots",
-  {
-    title: "Manage Vocal FX Snapshots",
-    description:
-      "Scene-based recall plan for vocal FX chains. User needs their own FX VSTs installed (examples to communicate): Soundtoys Effect Rack, Valhalla DSP (Supermassive / VintageVerb), FabFilter Timeless 3, Soundtoys EchoBoy / PrimalTap, Cableguys ShaperBox, RC-20 Retro Color.",
-    inputSchema: {
-      sceneNames: z.array(z.string().min(1).max(64)).min(1).max(8)
-    }
-  },
-  async ({ sceneNames }) =>
-    withMetrics("manage_vocal_fx_snapshots", async () =>
-      textResult({
-        ok: true,
-        sceneNames,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Soundtoys Effect Rack",
-          "Valhalla Supermassive",
-          "Valhalla VintageVerb",
-          "FabFilter Timeless 3",
-          "Soundtoys EchoBoy",
-          "Soundtoys PrimalTap",
-          "Cableguys ShaperBox 2",
-          "RC-20 Retro Color"
-        ],
-        plan: sceneNames.map((name, i) => ({
-          scene: i,
-          name,
-          action: "Map device chain bypass states and send levels per scene; document wet/dry baselines."
-        }))
-      })
-    )
-);
-
-server.registerTool(
-  "audit_vocal_monitor_path_safety",
-  {
-    title: "Audit Vocal Monitor Path Safety",
-    description:
-      "Cue path safety checklist (feedback, level, limiting). Plugins to recommend: Sonarworks SoundID Reference, Waves Nx, IK Multimedia ARC, master/cue limiter FabFilter Pro-L 2 / Waves L2 / Vladg Limiter No6 / iZotope Ozone Maximizer (use gently on cue).",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("audit_vocal_monitor_path_safety", async () =>
-      textResult({
-        ok: true,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Sonarworks SoundID Reference",
-          "Waves Nx",
-          "IK Multimedia ARC",
-          "FabFilter Pro-L 2",
-          "Waves L2 Ultramaximizer",
-          "Vladg Sound Limiter No6",
-          "iZotope Ozone Maximizer"
-        ],
-        checks: [
-          "Cue send pre/post fader: avoid feedback loop on live mic.",
-          "Insert true-peak-aware limiter last on headphone cue if artist wants loud cue.",
-          "Calibrate headphones if using translation-critical decisions."
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "configure_vocal_setlist_scenes",
-  {
-    title: "Configure Vocal Setlist Scenes",
-    description:
-      "Per-song scene checklist for live vocals (arm track, tempo, rack). No specific plugins required; user must install whatever vocal FX rack they use (e.g. UAD, Waves, Soundtoys chains referenced in manage_vocal_fx_snapshots).",
-    inputSchema: {
-      songs: z.array(z.object({ title: z.string().min(1).max(128), bpm: z.number().min(40).max(300) })).min(1).max(24)
-    }
-  },
-  async ({ songs }) =>
-    withMetrics("configure_vocal_setlist_scenes", async () =>
-      textResult({
-        ok: true,
-        songs,
-        pluginsRequired: [],
-        pluginsOptional: ["User's live vocal rack (UAD / Waves / Soundtoys / FabFilter — install separately)"],
-        perSong: songs.map((s, i) => ({
-          sceneIndex: i,
-          title: s.title,
-          targetBpm: s.bpm,
-          checklist: ["Arm vocal input", "Load rack snapshot", "Set tempo (e.g. set_tempo action) before scene launch"],
-          tempoOscHint: { address: "/live/song/set/tempo", args: [s.bpm] }
-        }))
-      })
-    )
-);
-
-server.registerTool(
-  "plan_vocal_delivery_variants",
-  {
-    title: "Plan Vocal Delivery Variants",
-    description:
-      "TV mix / clean / explicit / instrumental matrix for vocals. Loudness QC plugins: Youlean Loudness Meter (free), iZotope Insight, Nugen VisLM, Mastering The Mix LEVELS.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("plan_vocal_delivery_variants", async () =>
-      textResult({
-        ok: true,
-        pluginsRequired: [],
-        pluginsOptional: ["Youlean Loudness Meter", "iZotope Insight", "Nugen VisLM", "Mastering The Mix LEVELS"],
-        variants: [
-          { name: "master_full", includes: ["music", "lead_vox", "bv", "explicit_lyrics"] },
-          { name: "tv_mix", includes: ["music", "lead_vox", "bv", "bleeped_or_alt_lyrics"] },
-          { name: "clean", includes: ["music", "lead_vox", "bv", "no_explicit"] },
-          { name: "instrumental", includes: ["music", "no_lead_vox"] },
-          { name: "acapella", includes: ["lead_vox", "bv", "no_music"] }
-        ],
-        note: "Mute/solo and export via your existing render tools; this tool is naming + intent only."
-      })
-    )
-);
-
-server.registerTool(
-  "plan_vocal_stem_export_naming",
-  {
-    title: "Plan Vocal Stem Export Naming",
-    description:
-      "Standard names for lead dry, lead FX, doubles, BVs. No plugins required for naming. Optional print prep: UAD Studer A800 / Ampex ATR-102 for tape flavor on vocal bus — purely optional.",
-    inputSchema: { artistSlug: z.string().min(1).max(64).optional().default("artist") }
-  },
-  async ({ artistSlug }) =>
-    withMetrics("plan_vocal_stem_export_naming", async () =>
-      textResult({
-        ok: true,
-        artistSlug,
-        pluginsRequired: [],
-        pluginsOptional: ["UAD Studer A800", "UAD Ampex ATR-102"],
-        stemNames: [
-          `${artistSlug}_lead_vox_dry.wav`,
-          `${artistSlug}_lead_vox_fx.wav`,
-          `${artistSlug}_dbl_L.wav`,
-          `${artistSlug}_dbl_R.wav`,
-          `${artistSlug}_bv_bus.wav`,
-          `${artistSlug}_adlibs.wav`
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "plan_vocal_chain_ab_snapshots",
-  {
-    title: "Plan Vocal Chain A/B Snapshots",
-    description:
-      "Gain-matched A/B plan for vocal FX chains. Plugins for level-matched shootouts: Plugin Alliance ADPTR Metric A/B, Sample Magic Magic AB, Letimix GainMatch, Melda MCompare, FabFilter Pro-Q 3 (match spectrum). Stock: Utility for trim only.",
-    inputSchema: { chainLabel: z.string().min(1).max(64).optional().default("Lead Vox FX") }
-  },
-  async ({ chainLabel }) =>
-    withMetrics("plan_vocal_chain_ab_snapshots", async () =>
-      textResult({
-        ok: true,
-        chainLabel,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Plugin Alliance ADPTR Metric A/B",
-          "Sample Magic Magic AB",
-          "Letimix GainMatch",
-          "MeldaProduction MCompare",
-          "FabFilter Pro-Q 3 (EQ match / level)",
-          "Ableton Utility (trim / polarity only — stock)"
-        ],
-        steps: [
-          "Duplicate chain to inactive rack; match perceived loudness before tone judgments.",
-          "Bypass one path at a time; do not change input trim between A and B.",
-          "Print short noise burst through both paths to verify level match."
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "run_low_latency_vocal_tracking_checklist",
-  {
-    title: "Run Low-Latency Vocal Tracking Checklist",
-    description:
-      "Buffer, monitoring, and delay-compensation checklist for tracking. Low-latency monitoring: UAD Apollo + Console, Antelope Discrete, RME TotalMix, Focusrite Control — driver dependent. In-the-box: reduce buffer, freeze/disable heavy master chain, use Live’s Reduced Latency When Monitoring.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("run_low_latency_vocal_tracking_checklist", async () =>
-      textResult({
-        ok: true,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "UAD Apollo + Console (Unison preamps)",
-          "Antelope Audio Discrete / Control Panel",
-          "RME TotalMix FX",
-          "Focusrite Control (Air / monitoring)",
-          "Ableton stock: Reduce Latency When Monitoring"
-        ],
-        checklist: [
-          "Set smallest stable buffer size (256/128/64) for round-trip test.",
-          "Disable CPU-heavy master inserts while tracking; use tracking-friendly vocal rack.",
-          "Prefer hardware monitoring or Live low-latency mode over latent sends on cue."
-        ]
-      })
-    )
-);
-
-server.registerTool(
   "plan_duet_harmony_recording_session",
   {
     title: "Plan Duet / Harmony Recording Session",
@@ -8294,101 +5101,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "plan_vocal_adlib_lane",
-  {
-    title: "Plan Vocal Ad-Lib Lane",
-    description:
-      "Naming and arrangement plan for ad-lib passes vs main doubles. Pitch tools for wild ad-libs (optional): Antares Auto-Tune, Melodyne, Waves Tune Real-Time. Comping: stock or VocAlign for doubles.",
-    inputSchema: { songSection: z.string().min(1).max(64).optional().default("HOOK") }
-  },
-  async ({ songSection }) =>
-    withMetrics("plan_vocal_adlib_lane", async () =>
-      textResult({
-        ok: true,
-        songSection,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Antares Auto-Tune Pro",
-          "Celemony Melodyne",
-          "Waves Tune Real-Time",
-          "Synchro Arts VocAlign"
-        ],
-        clipNaming: [`ADLIB_${songSection}_01`, `ADLIB_${songSection}_FREESTYLE`, `STACK_${songSection}_CALL`],
-        rules: [
-          "Keep ad-libs on separate track from lead comp for selective mute in clean TV mix.",
-          "Mark explicit vs clean alt takes in clip name."
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "plan_vocal_tone_modes_scenes",
-  {
-    title: "Plan Vocal Tone Modes (Whisper / Fry / Belt)",
-    description:
-      "Scene templates for tone modes with FX and gain-staging notes. Plugins: Soundtoys Little AlterBoy (formant), Decapitator / Radiator (saturation), FabFilter Saturn 2, iZotope Nectar (Breath / saturation modules), oeksound Soothe2 (harshness on belt).",
-    inputSchema: { modes: z.array(z.enum(["whisper", "fry", "belt", "head", "mix"])).min(1).max(5) }
-  },
-  async ({ modes }) =>
-    withMetrics("plan_vocal_tone_modes_scenes", async () =>
-      textResult({
-        ok: true,
-        modes,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Soundtoys Little AlterBoy",
-          "Soundtoys Decapitator",
-          "Soundtoys Radiator",
-          "FabFilter Saturn 2",
-          "iZotope Nectar 4",
-          "oeksound Soothe2"
-        ],
-        perMode: modes.map((m) => ({
-          mode: m,
-          gainStaging:
-            m === "whisper"
-              ? "High noise floor risk: HPF gently; serial gentle comp; de-ess lighter."
-              : m === "belt"
-                ? "Watch ess + 3–5 kHz; limiter last; more headroom on preamp input."
-                : "Control subharmonics / distortion build-up; clip long sustains if fry-heavy."
-        }))
-      })
-    )
-);
-
-server.registerTool(
-  "plan_choir_stack_builder",
-  {
-    title: "Plan Choir Stack Builder",
-    description:
-      "3+ part vocal stack layout (S/A/T/B or uni sections) with panning and section labels. Widening / room: Waves Doubler, Soundtoys MicroShift, Valhalla Room / VintageVerb, Spitfire Symphonic Choirs (if writing pads) — optional.",
-    inputSchema: {
-      parts: z.array(z.string().min(1).max(32)).min(2).max(8).optional().default(["Soprano", "Alto", "Tenor", "Bass"])
-    }
-  },
-  async ({ parts }) =>
-    withMetrics("plan_choir_stack_builder", async () =>
-      textResult({
-        ok: true,
-        parts,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Waves Doubler",
-          "Soundtoys MicroShift",
-          "Valhalla Room / VintageVerb",
-          "Spitfire Symphonic Choirs (instrument pad under vocals)"
-        ],
-        layout: parts.map((p, i) => ({
-          trackName: `CHOIR_${p.replace(/\s+/g, "_")}`,
-          pan: Math.round(((((i + 0.5) / parts.length) * 2 - 1) * 0.42 + Number.EPSILON) * 1000) / 1000,
-          note: "Group to CHOIR_BUS; shared short room + longer hall send."
-        }))
-      })
-    )
-);
-
-server.registerTool(
   "plan_melody_to_midi_capture_workflow",
   {
     title: "Plan Melody-to-MIDI Capture Workflow",
@@ -8428,99 +5140,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "run_vocal_pitch_vibrato_analysis_placeholder",
-  {
-    title: "Run Vocal Pitch / Vibrato Analysis (Placeholder)",
-    description:
-      "Explains limits of OSC-only bridge; real stats need offline analysis. Use: Celemony Melodyne, Waves Tune, Synchro Arts RePitch, iZotope RX (Pitch module in some versions), TuneBoy — or export to DAW with analysis.",
-    inputSchema: { trackName: z.string().min(1).max(128).optional() }
-  },
-  async ({ trackName }) =>
-    withMetrics("run_vocal_pitch_vibrato_analysis_placeholder", async () =>
-      textResult({
-        ok: true,
-        trackName: trackName ?? null,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "Celemony Melodyne",
-          "Waves Tune",
-          "Synchro Arts RePitch",
-          "TuneBoy",
-          "iZotope RX (where pitch tools licensed)"
-        ],
-        metricsPlaceholder: {
-          meanPitchDriftCents: null,
-          vibratoRateHz: null,
-          vibratoWidthCents: null
-        },
-        disclaimer:
-          "This MCP server does not analyze audio buffers. Bounce/import into Melodyne or similar for real pitch/vibrato statistics."
-      })
-    )
-);
-
-server.registerTool(
-  "run_vocal_breath_detector_v2_placeholder",
-  {
-    title: "Run Vocal Breath Detector v2 (Placeholder)",
-    description:
-      "Spectral breath detection requires audio analysis. Plugins: iZotope RX Breath Control, Waves DeBreath, Accusonus ERA Breath Remover, Acon Digital Extract:Dialogue — run in host or external editor after export.",
-    inputSchema: { trackName: z.string().min(1).max(128).optional() }
-  },
-  async ({ trackName }) =>
-    withMetrics("run_vocal_breath_detector_v2_placeholder", async () =>
-      textResult({
-        ok: true,
-        trackName: trackName ?? null,
-        pluginsRequired: [],
-        pluginsOptional: [
-          "iZotope RX Breath Control",
-          "Waves DeBreath",
-          "Accusonus ERA Breath Remover",
-          "Acon Digital Extract:Dialogue"
-        ],
-        regions: [],
-        disclaimer: "No waveform access via OSC; use RX/ERA on rendered vocal or ARA in Live."
-      })
-    )
-);
-
-server.registerTool(
-  "run_vocal_range_report_session",
-  {
-    title: "Run Vocal Range Report Session",
-    description:
-      "Structured form for comfort range and tessitura (user- or coach-filled). Reference pitch apps (optional): TE Tuner, Cleartune, Vocal Pitch Monitor (mobile), Melodyne for measured range after recording scales.",
-    inputSchema: {
-      lowestNote: z.string().max(8).optional(),
-      highestNote: z.string().max(8).optional(),
-      chestTop: z.string().max(8).optional(),
-      headBottom: z.string().max(8).optional(),
-      fatigueNotes: z.string().max(500).optional()
-    }
-  },
-  async ({ lowestNote, highestNote, chestTop, headBottom, fatigueNotes }) =>
-    withMetrics("run_vocal_range_report_session", async () =>
-      textResult({
-        ok: true,
-        pluginsRequired: [],
-        pluginsOptional: ["TE Tuner", "Cleartune", "Melodyne (post-recording measurement)", "Vocal Pitch Monitor (mobile)"],
-        report: {
-          lowestNote: lowestNote ?? null,
-          highestNote: highestNote ?? null,
-          chestTop: chestTop ?? null,
-          headBottom: headBottom ?? null,
-          fatigueNotes: fatigueNotes ?? null
-        },
-        coachPrompts: [
-          "Sing gentle 5-note slides chest→mix→head; log where flip feels free.",
-          "Mark highest note held comfortably for 4+ seconds."
-        ]
-      })
-    )
-);
-
-server.registerTool(
   "sync_producer_singer_revision_notes",
   {
     title: "Sync Producer / Singer Revision Notes",
@@ -8554,59 +5173,6 @@ server.registerTool(
         namingTip: "Prefix REV_ or SINGER_ so searches in Live browser locate feedback quickly."
       });
     })
-);
-
-server.registerTool(
-  "plan_vocal_pronunciation_diction_guide",
-  {
-    title: "Plan Vocal Pronunciation / Diction Guide",
-    description:
-      "Line-by-line diction scaffolding (IPA hints are assistant-authored; verify with coach). Plugins: none. Optional phonetic reference: Forvo / IPA charts outside Live.",
-    inputSchema: {
-      lines: z.array(z.string().min(1).max(256)).min(1).max(48)
-    }
-  },
-  async ({ lines }) =>
-    withMetrics("plan_vocal_pronunciation_diction_guide", async () =>
-      textResult({
-        ok: true,
-        pluginsRequired: [],
-        pluginsOptional: [],
-        entries: lines.map((text, i) => ({
-          lineIndex: i + 1,
-          lyric: text,
-          ipaPlaceholder: "[coach fills IPA]",
-          consonantFocus: "Mark final consonants and dipthong targets."
-        })),
-        note: "Claude can propose IPA per line in chat; singer should validate with native speaker or coach."
-      })
-    )
-);
-
-server.registerTool(
-  "run_vocal_health_fatigue_guard",
-  {
-    title: "Run Vocal Health / Fatigue Guard",
-    description:
-      "Session length, break, and SPL-aware reminders (policy text). SPL monitoring (optional): NIOSH SLM app, SoundMeter (iOS), FabFilter Pro-L 2 true-peak on cue is not SPL — use hardware meter or phone app.",
-    inputSchema: {
-      maxSessionMinutes: z.number().min(20).max(240).optional().default(120),
-      breakEveryMinutes: z.number().min(10).max(60).optional().default(25)
-    }
-  },
-  async ({ maxSessionMinutes, breakEveryMinutes }) =>
-    withMetrics("run_vocal_health_fatigue_guard", async () =>
-      textResult({
-        ok: true,
-        pluginsRequired: [],
-        pluginsOptional: ["NIOSH Sound Level Meter (app)", "SoundMeter (iOS)", "FabFilter Pro-L 2 (peak on mix — not SPL)"],
-        policy: [
-          `Break every ~${breakEveryMinutes} minutes; hydrate; reset ears.`,
-          `Cap heavy belting blocks to shorter spans inside ${maxSessionMinutes} min session budget.`,
-          "If throat feels dry, stop; no plugin replaces rest."
-        ]
-      })
-    )
 );
 
 server.registerTool(
@@ -8674,35 +5240,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "plan_lead_tuned_vs_raw_stem_matrix",
-  {
-    title: "Plan Lead Tuned vs Raw Stem Matrix",
-    description:
-      "Naming matrix for raw vs tuned lead exports. Tuning plugins implied for tuned stem: Celemony Melodyne, Antares Auto-Tune, Waves Tune, Synchro Arts RePitch. Print tuned stem post-commit; keep raw for film/legal alt.",
-    inputSchema: { artistSlug: z.string().min(1).max(64).optional().default("artist") }
-  },
-  async ({ artistSlug }) =>
-    withMetrics("plan_lead_tuned_vs_raw_stem_matrix", async () =>
-      textResult({
-        ok: true,
-        artistSlug,
-        pluginsRequired: [],
-        pluginsOptional: ["Celemony Melodyne", "Antares Auto-Tune Pro", "Waves Tune", "Synchro Arts RePitch"],
-        stems: [
-          `${artistSlug}_lead_vox_RAW.wav`,
-          `${artistSlug}_lead_vox_TUNED.wav`,
-          `${artistSlug}_lead_vox_TUNED_ALT.wav`,
-          `${artistSlug}_lead_vox_RAW_NOFX.wav`
-        ],
-        policy: [
-          "Never overwrite raw archive; tuned is derived.",
-          "Document tuning amount for sync clients if requested."
-        ]
-      })
-    )
-);
-
-server.registerTool(
   "plan_sync_picture_vocal_cues",
   {
     title: "Plan Sync-to-Picture Vocal Cues",
@@ -8744,31 +5281,6 @@ server.registerTool(
         note: "Lock picture frame rate in session notes; SMPTE here is annotation only unless linked externally."
       });
     })
-);
-
-server.registerTool(
-  "comp_take_assistant",
-  {
-    title: "Comp Take Assistant",
-    description: "Create take comping recommendations scaffold for a track.",
-    inputSchema: {
-      trackName: z.string().min(1).max(128),
-      strategy: z.enum(["best-energy", "best-pitch", "hybrid"]).optional().default("hybrid")
-    }
-  },
-  async ({ trackName, strategy }) =>
-    withMetrics("comp_take_assistant", async () =>
-      textResult({
-        ok: true,
-        trackName,
-        strategy,
-        recommendations: [
-          "Use first phrase from Take 2 for clean attack.",
-          "Use sustain from Take 4 for stable tail.",
-          "Apply 20ms crossfade at each comp boundary."
-        ]
-      })
-    )
 );
 
 server.registerTool(
@@ -8839,7 +5351,8 @@ server.registerTool(
   "semantic_clip_edit",
   {
     title: "Semantic Clip Edit",
-    description: "Interpret a semantic edit command and return executable clip-edit plan.",
+    description:
+      "Semantic edits on clip MIDI in a Session slot (not Arrangement-only). applyWrites defaults true. See response abletonUi for where to look in Live.",
     inputSchema: {
       trackIndex: z.number().int().min(0),
       clipIndex: z.number().int().min(0),
@@ -8952,73 +5465,119 @@ server.registerTool(
         replaceMode,
         clearResult,
         writesApplied: applyWrites,
-        writesCount: writes.length
+        writesCount: writes.length,
+        ...(applyWrites ? sessionClipPlacementHint(trackIndex, clipIndex) : {})
       });
     })
-);
-
-server.registerTool(
-  "harmony_arranger",
-  {
-    title: "Harmony Arranger",
-    description: "Generate section-wise harmonic plan scaffold.",
-    inputSchema: {
-      key: z.string().min(1).max(3),
-      scale: z.enum(["major", "minor"]),
-      sections: z.array(z.string().min(1).max(64)).min(1)
-    }
-  },
-  async ({ key, scale, sections }) =>
-    withMetrics("harmony_arranger", async () =>
-      textResult({
-        ok: true,
-        key,
-        scale,
-        sections: sections.map((s, i) => ({
-          section: s,
-          suggestedProgression: i % 2 === 0 ? "i-VI-III-VII" : "i-iv-VII-III"
-        }))
-      })
-    )
 );
 
 server.registerTool(
   "humanize_drums",
   {
     title: "Humanize Drums",
-    description: "Apply drum humanization scaffold settings.",
+    description:
+      "Reads clip MIDI, clears notes (best-effort), re-adds with timing/velocity jitter. writeToLive defaults true. If clear endpoint is missing, new notes may stack on old ones — use replace in Live or semantic_clip_edit replaceMode.",
     inputSchema: {
       trackIndex: z.number().int().min(0),
       clipIndex: z.number().int().min(0),
       timingMs: z.number().min(0).max(40).optional().default(12),
-      velocitySpread: z.number().int().min(0).max(40).optional().default(18)
+      velocitySpread: z.number().int().min(0).max(40).optional().default(18),
+      writeToLive: z.boolean().optional().default(true)
     }
   },
-  async ({ trackIndex, clipIndex, timingMs, velocitySpread }) =>
-    withMetrics("humanize_drums", async () =>
-      textResult({ ok: true, trackIndex, clipIndex, timingMs, velocitySpread })
-    )
+  async ({ trackIndex, clipIndex, timingMs, velocitySpread, writeToLive }) =>
+    withMetrics("humanize_drums", async () => {
+      const tempoResp = await requestKnown("tempoGet", ["/live/song/get/tempo", "/live/song/tempo"]);
+      const bpm = Number(parseOscValue(tempoResp.response, 120));
+      const beatJitter = timingMs > 0 ? (timingMs / 1000) * (bpm / 60) : 0;
+      const noteResp = await requestAny(["/live/clip/get/notes", "/live/clip/get/notes_extended"], [
+        intArg(trackIndex),
+        intArg(clipIndex)
+      ]);
+      const raw = parseOscValue(noteResp.response, []);
+      const incoming = extractClipNotes(raw);
+      if (!writeToLive) {
+        return textResult({
+          ok: true,
+          trackIndex,
+          clipIndex,
+          timingMs,
+          velocitySpread,
+          inputNotes: incoming.length,
+          writeToLive: false,
+          reminder: "writeToLive=false: preview only."
+        });
+      }
+      const clearResult = await clearClipNotesBestEffort(trackIndex, clipIndex);
+      const humanized = incoming.map((n) => {
+        const j = beatJitter > 0 ? (Math.random() * 2 - 1) * beatJitter * 0.5 : 0;
+        const start = Math.max(0, Number((n.start + j).toFixed(4)));
+        const vel = Math.max(
+          1,
+          Math.min(127, Math.round((n.velocity ?? 100) + (Math.random() * 2 - 1) * velocitySpread))
+        );
+        return { ...n, start, velocity: vel };
+      });
+      const writes = [];
+      for (const n of humanized) {
+        writes.push(
+          sendPlanRaw("/live/clip/add_note", [
+            intArg(trackIndex),
+            intArg(clipIndex),
+            intArg(n.pitch),
+            floatArg(n.start),
+            floatArg(n.duration),
+            intArg(n.velocity),
+            intArg(n.mute ? 1 : 0)
+          ])
+        );
+      }
+      return textResult({
+        ok: true,
+        trackIndex,
+        clipIndex,
+        timingMs,
+        velocitySpread,
+        inputNotes: incoming.length,
+        outputNotes: humanized.length,
+        clearResult,
+        writesCount: writes.length,
+        dryRun: config.ABLETON_DRY_RUN,
+        ...sessionClipPlacementHint(trackIndex, clipIndex)
+      });
+    })
 );
 
 server.registerTool(
   "apply_fx_chain_template",
   {
     title: "Apply FX Chain Template",
-    description: "Apply and validate FX chain template scaffold.",
+    description:
+      "Best-effort load of a device preset by name on device slot 0 (OSC). templateName should match a Live preset path/name your AbletonOSC accepts. Set dryRun-style preview with applyPreset=false.",
     inputSchema: {
       trackIndex: z.number().int().min(0),
-      templateName: z.string().min(1).max(128)
+      templateName: z.string().min(1).max(128),
+      applyPreset: z.boolean().optional().default(true)
     }
   },
-  async ({ trackIndex, templateName }) =>
-    withMetrics("apply_fx_chain_template", async () =>
-      textResult({
-        ok: true,
-        trackIndex,
-        templateName,
-        validation: ["Check device availability", "Check routing compatibility", "Check parameter defaults"]
-      })
-    )
+  async ({ trackIndex, templateName, applyPreset }) =>
+    withMetrics("apply_fx_chain_template", async () => {
+      if (!applyPreset) {
+        return textResult({
+          ok: true,
+          trackIndex,
+          templateName,
+          applyPreset: false,
+          validation: ["Check device availability", "Check routing compatibility", "Set applyPreset=true to send load_preset OSC"]
+        });
+      }
+      return sendKnownMaybe(
+        "deviceLoadPreset",
+        ["/live/device/load_preset", "/live/device/set/preset", "/live/device/load/device_preset"],
+        [intArg(trackIndex), intArg(0), stringArg(templateName)],
+        { trackIndex, deviceIndex: 0, templateName }
+      );
+    })
 );
 
 server.registerTool(
@@ -9074,58 +5633,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "prepare_stems_one_click",
-  {
-    title: "Prepare Stems One Click",
-    description: "Scaffold stem prep: naming, grouping, and render prep.",
-    inputSchema: {
-      namingPrefix: z.string().min(1).max(64).optional().default("STEM"),
-      includeReturns: z.boolean().optional().default(true)
-    }
-  },
-  async ({ namingPrefix, includeReturns }) =>
-    withMetrics("prepare_stems_one_click", async () =>
-      textResult({ ok: true, namingPrefix, includeReturns, next: "Call export_batch_profiles or render_stems." })
-    )
-);
-
-server.registerTool(
-  "session_diff_undo_bundle",
-  {
-    title: "Session Diff Undo Bundle",
-    description: "Summarize recent command delta and suggest grouped rollback steps.",
-    inputSchema: { lastN: z.number().int().min(1).max(100).optional().default(10) }
-  },
-  async ({ lastN }) =>
-    withMetrics("session_diff_undo_bundle", async () =>
-      textResult({
-        ok: true,
-        lastN,
-        summary: `Review last ${lastN} audit entries in logs/audit.jsonl and consider undo/restore snapshot.`
-      })
-    )
-);
-
-server.registerTool(
-  "auto_scene_sequencer",
-  {
-    title: "Auto Scene Sequencer",
-    description: "Build scene sequencing scaffold with transition timings.",
-    inputSchema: {
-      scenes: z.array(z.number().int().min(0)).min(1),
-      barsPerScene: z.number().int().min(1).max(128).optional().default(8)
-    }
-  },
-  async ({ scenes, barsPerScene }) =>
-    withMetrics("auto_scene_sequencer", async () =>
-      textResult({
-        ok: true,
-        sequence: scenes.map((s, idx) => ({ sceneIndex: s, startBars: idx * barsPerScene, bars: barsPerScene }))
-      })
-    )
-);
-
-server.registerTool(
   "create_panic_macro",
   {
     title: "Create Panic Macro",
@@ -9166,98 +5673,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "record_prompt_macro",
-  {
-    title: "Record Prompt Macro",
-    description: "Store prompt-to-macro mapping scaffold.",
-    inputSchema: {
-      macroName: z.string().min(1).max(128),
-      prompt: z.string().min(1).max(256),
-      actions: z.array(z.string().min(1).max(128)).min(1)
-    }
-  },
-  async ({ macroName, prompt, actions }) =>
-    withMetrics("record_prompt_macro", async () => {
-      macroRegistry.set(normalizeName(macroName), {
-        name: macroName,
-        prompt,
-        actions,
-        createdAt: new Date().toISOString()
-      });
-      return textResult({ ok: true, macro: macroRegistry.get(normalizeName(macroName)) });
-    })
-);
-
-server.registerTool(
-  "project_cleanup_bot",
-  {
-    title: "Project Cleanup Bot",
-    description: "Scan project state and suggest cleanup actions scaffold.",
-    inputSchema: {}
-  },
-  async () =>
-    withMetrics("project_cleanup_bot", async () =>
-      textResult({
-        ok: true,
-        suggestions: [
-          "Delete empty MIDI clips in inactive scenes.",
-          "Disable unused return chains.",
-          "Remove muted-for-long tracks after verification."
-        ]
-      })
-    )
-);
-
-server.registerTool(
-  "reference_match_assistant",
-  {
-    title: "Reference Match Assistant",
-    description: "Reference tonal/dynamics matching scaffold.",
-    inputSchema: { referenceName: z.string().min(1).max(128) }
-  },
-  async ({ referenceName }) =>
-    withMetrics("reference_match_assistant", async () =>
-      textResult({
-        ok: true,
-        referenceName,
-        guidance: ["Match perceived loudness first", "Compare low-end balance", "Compare transient sharpness"]
-      })
-    )
-);
-
-server.registerTool(
-  "set_collaborator_mode",
-  {
-    title: "Set Collaborator Mode",
-    description: "Apply collaborator permission preset to runtime context.",
-    inputSchema: { mode: z.enum(["producer", "mixer", "performer", "observer"]) }
-  },
-  async ({ mode }) =>
-    withMetrics("set_collaborator_mode", async () => {
-      const preset = collaboratorModes.get(mode);
-      runtimeContext.role = preset.role;
-      runtimeContext.performanceMode = preset.performanceMode;
-      return textResult({ ok: true, mode, runtimeContext });
-    })
-);
-
-server.registerTool(
-  "task_linked_production_flow",
-  {
-    title: "Task Linked Production Flow",
-    description: "Create mapping scaffold between tasks and Ableton operations.",
-    inputSchema: {
-      taskTitle: z.string().min(1).max(200),
-      suggestedAction: z.string().min(1).max(128)
-    }
-  },
-  async ({ taskTitle, suggestedAction }) =>
-    withMetrics("task_linked_production_flow", async () =>
-      textResult({ ok: true, taskTitle, suggestedAction, externalHooks })
-    )
-);
-
-server.registerTool(
   "voice_live_mode_command",
   {
     title: "Voice Live Mode Command",
@@ -9271,33 +5686,7 @@ server.registerTool(
         sendPlanRaw("/live/song/stop_all_clips", []);
         return textResult({ ok: true, interpretedAction: "stop_all_clips" });
       }
-      return textResult({ ok: true, interpretedAction: "compile_musical_intent", phrase });
-    })
-);
-
-server.registerTool(
-  "plugin_preset_intelligence",
-  {
-    title: "Plugin Preset Intelligence",
-    description: "Suggest preset names by semantic intent and optionally register alias.",
-    inputSchema: {
-      intent: z.string().min(1).max(128),
-      presetAlias: z.string().min(1).max(128).optional()
-    }
-  },
-  async ({ intent, presetAlias }) =>
-    withMetrics("plugin_preset_intelligence", async () => {
-      const suggestions = intent.toLowerCase().includes("warm")
-        ? ["Warm Tape Glue", "Analog Soft Saturator", "Velvet Pad Space"]
-        : ["Clean Control", "Modern Tight Bus", "Neutral Utility"];
-      if (presetAlias) {
-        presetRegistry.set(normalizeName(presetAlias), {
-          presetAlias,
-          presetName: suggestions[0],
-          updatedAt: new Date().toISOString()
-        });
-      }
-      return textResult({ ok: true, intent, suggestions, registeredAlias: presetAlias ?? null });
+      return textResult({ ok: true, interpretedAction: "noop", phrase });
     })
 );
 
