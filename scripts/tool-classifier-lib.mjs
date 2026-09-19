@@ -1,4 +1,4 @@
-/** Shared parser for server.registerTool(...) blocks in src/index.js */
+/** Shared parser for registerMcpTool(...) / server.registerTool(...) blocks in src/index.js */
 
 export const oscSignals = [
   "sendMaybe(",
@@ -84,33 +84,47 @@ export function extractParenGroup(s, openParenIndex) {
 }
 
 export function listRegisterTools(src) {
-  const needle = "server.registerTool";
+  const needles = ["registerMcpTool", "server.registerTool"];
   const tools = [];
-  let pos = 0;
-  while (pos < src.length) {
-    const hit = src.indexOf(needle, pos);
-    if (hit === -1) break;
-    const parenIdx = src.indexOf("(", hit + needle.length);
-    if (parenIdx === -1) break;
-    const group = extractParenGroup(src, parenIdx);
-    if (!group) break;
-    const [innerStart, endAfterClose] = group;
-    const inner = src.slice(innerStart, endAfterClose - 1);
-    const nameMatch = inner.match(/^\s*"([^"]+)"/);
-    if (!nameMatch) {
-      pos = endAfterClose;
-      continue;
+  const seen = new Set();
+  for (const needle of needles) {
+    let pos = 0;
+    while (pos < src.length) {
+      const hit = src.indexOf(needle, pos);
+      if (hit === -1) break;
+      // Skip the wrapper definition: function registerMcpTool(
+      const before = src.slice(Math.max(0, hit - 20), hit);
+      if (/function\s*$/.test(before.trimEnd()) || /function\s+$/.test(before)) {
+        pos = hit + needle.length;
+        continue;
+      }
+      const parenIdx = src.indexOf("(", hit + needle.length);
+      if (parenIdx === -1) break;
+      const group = extractParenGroup(src, parenIdx);
+      if (!group) break;
+      const [innerStart, endAfterClose] = group;
+      const inner = src.slice(innerStart, endAfterClose - 1);
+      const nameMatch = inner.match(/^\s*"([^"]+)"/);
+      if (!nameMatch) {
+        pos = endAfterClose;
+        continue;
+      }
+      const name = nameMatch[1];
+      if (seen.has(name)) {
+        pos = endAfterClose;
+        continue;
+      }
+      seen.add(name);
+      const usesOsc = oscSignals.some((sig) => inner.includes(sig));
+      const usesPlanRunner = inner.includes("runActionPlanExecution(");
+      let endExclusive = endAfterClose;
+      if (src[endExclusive] === ";") endExclusive++;
+      while (endExclusive < src.length && (src[endExclusive] === "\n" || src[endExclusive] === "\r")) {
+        endExclusive++;
+      }
+      tools.push({ name, usesOsc, usesPlanRunner, start: hit, end: endExclusive });
+      pos = endExclusive;
     }
-    const name = nameMatch[1];
-    const usesOsc = oscSignals.some((sig) => inner.includes(sig));
-    const usesPlanRunner = inner.includes("runActionPlanExecution(");
-    let endExclusive = endAfterClose;
-    if (src[endExclusive] === ";") endExclusive++;
-    while (endExclusive < src.length && (src[endExclusive] === "\n" || src[endExclusive] === "\r")) {
-      endExclusive++;
-    }
-    tools.push({ name, usesOsc, usesPlanRunner, start: hit, end: endExclusive });
-    pos = endExclusive;
   }
   return tools;
 }

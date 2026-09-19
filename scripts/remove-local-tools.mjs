@@ -1,3 +1,8 @@
+/**
+ * Maintenance: strip local-only tools from src/index.js.
+ * Prefer ABLETON_ENABLE_SCAFFOLD_TOOLS gating over deleting source.
+ * Run only when you intend to mutate index.js.
+ */
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";

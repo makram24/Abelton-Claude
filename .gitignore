@@ -5,3 +5,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Runtime artifacts from the MCP server
+.ableton-*.json
+logs/
+*.log

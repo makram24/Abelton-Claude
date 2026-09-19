@@ -6,6 +6,11 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { AbletonOscClient, floatArg, intArg, stringArg } from "./abletonOsc.js";
 import { getConfig } from "./config.js";
+import { textResult } from "./lib/mcpResult.js";
+import { normalizeName, scoreNameMatch } from "./lib/names.js";
+import { parseOscValue } from "./lib/oscParse.js";
+import { classifyError } from "./lib/errors.js";
+import { isScaffoldTool } from "./toolTiers.js";
 
 const config = getConfig();
 const oscClient = new AbletonOscClient({
@@ -17,8 +22,21 @@ const oscClient = new AbletonOscClient({
 
 const server = new McpServer({
   name: "ableton-osc-bridge",
-  version: "0.1.0"
+  version: "0.2.0"
 });
+
+/** Registers core tools always; scaffolds only when ABLETON_ENABLE_SCAFFOLD_TOOLS=true. */
+function registerMcpTool(name, def, handler) {
+  if (isScaffoldTool(name) && !config.ABLETON_ENABLE_SCAFFOLD_TOOLS) {
+    return;
+  }
+  if (isScaffoldTool(name) && def && typeof def.description === "string") {
+    if (!def.description.startsWith("[scaffold]")) {
+      def = { ...def, description: `[scaffold] ${def.description}` };
+    }
+  }
+  return server.registerTool(name, def, handler);
+}
 
 const DESTRUCTIVE_CONFIRM_TOKEN = "YES_I_UNDERSTAND";
 const endpointSelections = new Map();
@@ -77,7 +95,7 @@ const policyState = {
   }
 };
 const runtimeContext = {
-  role: "admin",
+  role: config.ABLETON_DEFAULT_ROLE,
   performanceMode: false
 };
 const stateCache = {
@@ -211,16 +229,6 @@ const OSC_ENDPOINT_VARIANTS = {
   deviceLoadPreset: ["/live/device/load_preset", "/live/device/set/preset", "/live/device/load/device_preset"],
   subscribeEvents: ["/live/subscribe", "/live/events/subscribe", "/live/observe"]
 };
-
-function classifyError(error) {
-  const message = String(error?.message ?? error ?? "");
-  if (message.includes("EADDRINUSE")) return "PORT_CONFLICT";
-  if (message.includes("Timeout waiting for OSC response")) return "OSC_TIMEOUT";
-  if (message.includes("Role") && message.includes("not allowed")) return "POLICY_BLOCKED";
-  if (message.includes("Destructive action blocked")) return "DESTRUCTIVE_CONFIRM_REQUIRED";
-  if (message.includes("Unknown or disallowed action")) return "PLAN_ACTION_UNKNOWN";
-  return "UNKNOWN_ERROR";
-}
 
 async function appendAuditLog(entry) {
   try {
@@ -416,10 +424,6 @@ function buildCapabilityProfile() {
   };
 }
 
-function textResult(data) {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-}
-
 /** Live LOM current_monitoring_state: 0 = In, 1 = Auto, 2 = Off */
 function monitoringModeToInt(mode) {
   const m = String(mode ?? "auto").toLowerCase();
@@ -461,26 +465,6 @@ function toBoolInt(value) {
   return intArg(value ? 1 : 0);
 }
 
-function normalizeName(v) {
-  return String(v ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-function scoreNameMatch(query, candidate) {
-  const q = normalizeName(query);
-  const c = normalizeName(candidate);
-  if (!q || !c) return 0;
-  if (q === c) return 1;
-  if (c.startsWith(q)) return 0.9;
-  if (c.includes(q)) return 0.75;
-  const qTokens = q.split(" ").filter(Boolean);
-  const cTokens = c.split(" ").filter(Boolean);
-  const overlap = qTokens.filter((t) => cTokens.includes(t)).length;
-  return overlap / Math.max(qTokens.length, 1) * 0.6;
-}
-
 async function withMetrics(commandName, handler) {
   const start = Date.now();
   metrics.totalCommands += 1;
@@ -510,12 +494,6 @@ async function withMetrics(commandName, handler) {
     });
     throw error;
   }
-}
-
-function parseOscValue(msg, fallback = null) {
-  if (!msg?.args || msg.args.length === 0) return fallback;
-  if (msg.args.length === 1) return msg.args[0]?.value ?? fallback;
-  return msg.args.map((arg) => arg?.value);
 }
 
 async function requestAny(candidates, args = []) {
@@ -769,7 +747,7 @@ function sendMaybe(address, args = [], metadata = {}, options = {}) {
   return textResult(sendPlanRaw(address, args, metadata, options));
 }
 
-server.registerTool(
+registerMcpTool(
   "health_live_test",
   {
     title: "Health Live Test",
@@ -786,7 +764,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_smoke_check",
   {
     title: "Run Smoke Check",
@@ -833,7 +811,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "undo",
   {
     title: "Undo",
@@ -842,7 +820,7 @@ server.registerTool(
   async () => withMetrics("undo", async () => sendMaybe("/live/song/undo"))
 );
 
-server.registerTool(
+registerMcpTool(
   "redo",
   {
     title: "Redo",
@@ -1360,7 +1338,7 @@ async function runActionPlanExecution({
   };
 }
 
-server.registerTool(
+registerMcpTool(
   "execute_action_plan",
   {
     title: "Execute Action Plan",
@@ -1403,7 +1381,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "refresh_state_cache",
   {
     title: "Refresh State Cache",
@@ -1412,7 +1390,7 @@ server.registerTool(
   async () => withMetrics("refresh_state_cache", async () => textResult(await refreshStateCache()))
 );
 
-server.registerTool(
+registerMcpTool(
   "subscribe_session_events",
   {
     title: "Subscribe Session Events",
@@ -1438,7 +1416,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "detect_capability_profile",
   {
     title: "Detect Capability Profile",
@@ -1460,7 +1438,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "write_device_automation_curve",
   {
     title: "Write Device Automation Curve",
@@ -1521,7 +1499,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "render_with_profile",
   {
     title: "Render With Profile",
@@ -1554,7 +1532,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "create_export_job",
   {
     title: "Create Export Job",
@@ -1616,7 +1594,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_export_job",
   {
     title: "Run Export Job",
@@ -1666,7 +1644,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_track_routing",
   {
     title: "Set Track Routing",
@@ -1688,7 +1666,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "load_device_preset",
   {
     title: "Load Device Preset",
@@ -1720,7 +1698,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "warmup_write_endpoints",
   {
     title: "Warmup Write Endpoints",
@@ -1775,7 +1753,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "find_track_by_name",
   {
     title: "Find Track By Name",
@@ -1861,7 +1839,7 @@ async function refreshStateCache() {
   return stateCache;
 }
 
-server.registerTool(
+registerMcpTool(
   "set_track_volume_by_name",
   {
     title: "Set Track Volume By Name",
@@ -1882,7 +1860,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "launch_clip_by_track_name",
   {
     title: "Launch Clip By Track Name",
@@ -1903,7 +1881,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "render_project_audio",
   {
     title: "Render Project Audio",
@@ -1927,7 +1905,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "render_stems",
   {
     title: "Render Stems",
@@ -1950,7 +1928,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "reprobe_endpoints",
   {
     title: "Reprobe Endpoints",
@@ -1968,7 +1946,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "heartbeat",
   {
     title: "Heartbeat",
@@ -1996,7 +1974,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "start_playback",
   {
     title: "Start Playback",
@@ -2007,7 +1985,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "stop_playback",
   {
     title: "Stop Playback",
@@ -2018,7 +1996,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "set_tempo",
   {
     title: "Set Tempo",
@@ -2030,7 +2008,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "get_tempo",
   {
     title: "Get Tempo",
@@ -2048,7 +2026,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "launch_clip",
   {
     title: "Launch Clip",
@@ -2066,7 +2044,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "stop_track_clips",
   {
     title: "Stop Track Clips",
@@ -2082,7 +2060,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "stop_all_clips",
   {
     title: "Stop All Clips",
@@ -2091,7 +2069,7 @@ server.registerTool(
   async () => sendMaybe("/live/song/stop_all_clips")
 );
 
-server.registerTool(
+registerMcpTool(
   "launch_scene",
   {
     title: "Launch Scene",
@@ -2103,7 +2081,7 @@ server.registerTool(
   async ({ sceneIndex }) => sendMaybe("/live/scene/fire", [intArg(sceneIndex)], { sceneIndex })
 );
 
-server.registerTool(
+registerMcpTool(
   "list_tracks",
   {
     title: "List Tracks",
@@ -2131,7 +2109,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "get_session_overview",
   {
     title: "Get Session Overview",
@@ -2177,7 +2155,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "get_track_devices",
   {
     title: "Get Track Devices",
@@ -2210,7 +2188,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "get_device_parameters",
   {
     title: "Get Device Parameters",
@@ -2258,7 +2236,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "set_device_parameter",
   {
     title: "Set Device Parameter",
@@ -2278,7 +2256,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "create_midi_clip",
   {
     title: "Create MIDI Clip",
@@ -2303,7 +2281,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "delete_clip",
   {
     title: "Delete Clip (Destructive)",
@@ -2324,7 +2302,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerMcpTool(
   "set_track_name",
   {
     title: "Set Track Name",
@@ -2341,7 +2319,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "get_track_mixer",
   {
     title: "Get Track Mixer",
@@ -2368,7 +2346,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_track_mixer",
   {
     title: "Set Track Mixer",
@@ -2409,7 +2387,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_track_state",
   {
     title: "Set Track State",
@@ -2439,7 +2417,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_track_monitoring_mode",
   {
     title: "Set Track Monitoring Mode",
@@ -2477,7 +2455,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "prepare_midi_track_for_clip_playback",
   {
     title: "Prepare MIDI Track For Clip Playback",
@@ -2541,7 +2519,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "list_scenes",
   {
     title: "List Scenes",
@@ -2565,7 +2543,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "create_scene",
   {
     title: "Create Scene",
@@ -2581,7 +2559,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "rename_scene",
   {
     title: "Rename Scene",
@@ -2600,7 +2578,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "delete_scene",
   {
     title: "Delete Scene (Destructive)",
@@ -2620,7 +2598,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "get_clip_notes",
   {
     title: "Get Clip Notes",
@@ -2645,7 +2623,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "add_clip_notes",
   {
     title: "Add Clip Notes",
@@ -2690,7 +2668,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_transport_flags",
   {
     title: "Set Transport Flags",
@@ -2719,7 +2697,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_loop_region",
   {
     title: "Set Loop Region",
@@ -2741,7 +2719,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_arrangement_punch",
   {
     title: "Set Arrangement Punch",
@@ -2766,7 +2744,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "create_locator",
   {
     title: "Create Locator",
@@ -2786,7 +2764,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "jump_to_time",
   {
     title: "Jump To Time",
@@ -2801,7 +2779,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "arrangement_duplicate_range",
   {
     title: "Arrangement Duplicate Range",
@@ -2820,7 +2798,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "arrangement_delete_range",
   {
     title: "Arrangement Delete Range (Destructive)",
@@ -2842,7 +2820,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_device_automation_point",
   {
     title: "Set Device Automation Point",
@@ -2871,7 +2849,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "capture_session_snapshot",
   {
     title: "Capture Session Snapshot",
@@ -2904,7 +2882,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "restore_session_snapshot",
   {
     title: "Restore Session Snapshot",
@@ -3055,7 +3033,7 @@ async function resolveDrumMidiTrack({ trackName, trackIndex, allowFirstTrackFall
   );
 }
 
-server.registerTool(
+registerMcpTool(
   "arrangement_intelligence",
   {
     title: "Arrangement Intelligence",
@@ -3128,7 +3106,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_mix_health_check",
   {
     title: "Run Mix Health Check",
@@ -3188,7 +3166,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "apply_sound_design_macro",
   {
     title: "Apply Sound Design Macro",
@@ -3218,7 +3196,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "generate_midi_phrase",
   {
     title: "Generate MIDI Phrase",
@@ -3301,7 +3279,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "generate_drum_pattern",
   {
     title: "Generate Drum Pattern",
@@ -3415,7 +3393,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "performance_scene_action",
   {
     title: "Performance Scene Action",
@@ -3435,7 +3413,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "export_batch_profiles",
   {
     title: "Export Batch Profiles",
@@ -3498,7 +3476,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "semantic_plugin_control",
   {
     title: "Semantic Plugin Control",
@@ -3526,7 +3504,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_auto_mix_pass",
   {
     title: "Run Auto Mix Pass",
@@ -3592,7 +3570,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "auto_gain_stage_tracks",
   {
     title: "Auto Gain Stage Tracks",
@@ -3622,7 +3600,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "create_bus_architecture",
   {
     title: "Create Bus Architecture",
@@ -3660,7 +3638,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "detect_track_roles",
   {
     title: "Detect Track Roles",
@@ -3687,7 +3665,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_release_prep_pipeline",
   {
     title: "Run Release Prep Pipeline",
@@ -3799,7 +3777,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "resolve_kick_bass_conflict",
   {
     title: "Resolve Kick Bass Conflict",
@@ -3867,7 +3845,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_release_readiness_score",
   {
     title: "Run Release Readiness Score",
@@ -3917,7 +3895,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "error_recovery_autopilot",
   {
     title: "Error Recovery Autopilot",
@@ -3935,7 +3913,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "set_drum_bus_punch_mode",
   {
     title: "Set Drum Bus Punch Mode",
@@ -3979,7 +3957,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "restore_live_emergency_state",
   {
     title: "Restore Live Emergency State",
@@ -4023,7 +4001,7 @@ async function autoGainStage(sampleTracks, target) {
   return { ok: true, sampleTracks, target, writes };
 }
 
-server.registerTool(
+registerMcpTool(
   "run_phase_alignment_check",
   {
     title: "Run Phase Alignment Check",
@@ -4059,7 +4037,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_masking_analysis",
   {
     title: "Run Masking Analysis",
@@ -4084,7 +4062,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerMcpTool(
   "optimize_bus_compression",
   {
     title: "Optimize Bus Compression",
@@ -4126,7 +4104,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_stereo_image_optimizer",
   {
     title: "Run Stereo Image Optimizer",
@@ -4166,7 +4144,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_master_chain_safety_scan",
   {
     title: "Run Master Chain Safety Scan",
@@ -4189,7 +4167,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_mix_translation_diagnostics",
   {
     title: "Run Mix Translation Diagnostics",
@@ -4208,7 +4186,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "optimize_clip_gain",
   {
     title: "Optimize Clip Gain",
@@ -4230,7 +4208,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_noise_floor_check",
   {
     title: "Run Noise Floor Check",
@@ -4257,7 +4235,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_loudness_workflow_assistant",
   {
     title: "Run Loudness Workflow Assistant",
@@ -4281,7 +4259,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "analyze_spectral_balance_fingerprint",
   {
     title: "Analyze Spectral Balance Fingerprint",
@@ -4322,7 +4300,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "build_masking_map_v2",
   {
     title: "Build Masking Map v2",
@@ -4378,7 +4356,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "monitor_correlation_mono_sum",
   {
     title: "Monitor Correlation / Mono Sum",
@@ -4427,7 +4405,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "generate_de_essing_automation_plan",
   {
     title: "Generate De-Essing Automation Plan",
@@ -4457,7 +4435,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "plan_vocal_rider",
   {
     title: "Plan Vocal Rider",
@@ -4490,7 +4468,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "manage_send_reverb_economy",
   {
     title: "Manage Send / Reverb Economy",
@@ -4514,7 +4492,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "align_delay_coherence",
   {
     title: "Align Delay Coherence",
@@ -4544,7 +4522,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_kick_bass_phase_lab",
   {
     title: "Run Kick / Bass Phase Lab",
@@ -4580,7 +4558,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "build_drum_phase_alignment_pack",
   {
     title: "Build Drum Phase Alignment Pack",
@@ -4608,7 +4586,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "generate_dynamic_range_report",
   {
     title: "Generate Dynamic Range Report",
@@ -4646,7 +4624,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "plan_vocal_punch_in_session",
   {
     title: "Plan Vocal Punch-In Session",
@@ -4682,7 +4660,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "map_vocal_breath_noise_candidates",
   {
     title: "Map Vocal Breath / Noise Candidates",
@@ -4713,7 +4691,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "analyze_vocal_take_consistency",
   {
     title: "Analyze Vocal Take Consistency",
@@ -4752,7 +4730,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "setup_vocal_doubles_stack",
   {
     title: "Setup Vocal Doubles Stack",
@@ -4794,7 +4772,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_pre_bounce_sibilance_check",
   {
     title: "Run Pre-Bounce Sibilance Check",
@@ -4835,7 +4813,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "setup_warmup_then_record_scene",
   {
     title: "Setup Warmup Then Record Scene",
@@ -4860,7 +4838,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "generate_vocal_harmony_midi_scaffold",
   {
     title: "Generate Vocal Harmony MIDI Scaffold",
@@ -4926,7 +4904,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "setup_backing_vocal_bus",
   {
     title: "Setup Backing Vocal Bus",
@@ -4968,7 +4946,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "configure_singer_warmup_metronome",
   {
     title: "Configure Singer Warmup Metronome",
@@ -4997,7 +4975,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "export_lyric_cue_sheet_from_clips",
   {
     title: "Export Lyric Cue Sheet From Clips",
@@ -5037,7 +5015,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "plan_duet_harmony_recording_session",
   {
     title: "Plan Duet / Harmony Recording Session",
@@ -5067,7 +5045,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_vocal_booth_session_start_macro",
   {
     title: "Run Vocal Booth Session Start Macro",
@@ -5100,7 +5078,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "plan_melody_to_midi_capture_workflow",
   {
     title: "Plan Melody-to-MIDI Capture Workflow",
@@ -5139,7 +5117,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "sync_producer_singer_revision_notes",
   {
     title: "Sync Producer / Singer Revision Notes",
@@ -5175,7 +5153,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "suggest_song_key_from_session_midi",
   {
     title: "Suggest Song Key From Session MIDI",
@@ -5239,7 +5217,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "plan_sync_picture_vocal_cues",
   {
     title: "Plan Sync-to-Picture Vocal Cues",
@@ -5283,7 +5261,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "setup_sidechain_bus",
   {
     title: "Setup Sidechain Bus",
@@ -5347,7 +5325,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "semantic_clip_edit",
   {
     title: "Semantic Clip Edit",
@@ -5471,7 +5449,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "humanize_drums",
   {
     title: "Humanize Drums",
@@ -5548,7 +5526,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "apply_fx_chain_template",
   {
     title: "Apply FX Chain Template",
@@ -5580,7 +5558,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_master_bus_guardrails",
   {
     title: "Run Master Bus Guardrails",
@@ -5632,7 +5610,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "create_panic_macro",
   {
     title: "Create Panic Macro",
@@ -5653,7 +5631,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "run_macro",
   {
     title: "Run Macro",
@@ -5672,7 +5650,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "voice_live_mode_command",
   {
     title: "Voice Live Mode Command",
@@ -5690,7 +5668,7 @@ server.registerTool(
     })
 );
 
-server.registerTool(
+registerMcpTool(
   "export_deliverables_matrix",
   {
     title: "Export Deliverables Matrix",

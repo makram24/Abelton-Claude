@@ -1,6 +1,14 @@
 # Ableton MCP Roadmap
 
-This file tracks the full implementation roadmap requested for this project.
+This file tracks the implementation roadmap. Many later-phase items marked done are **scaffolds** (heuristic planners / checklists), not production DSP. They are **gated off by default** (`ABLETON_ENABLE_SCAFFOLD_TOOLS=false`). Prefer finishing open **core** gaps (Phases 2–6 unchecked items) over adding more scaffolds.
+
+## Portfolio cleanup (done)
+
+- [x] Core vs scaffold tool tiers + default core-only surface
+- [x] Extract pure helpers (`src/lib/*`, `toolTiers.js`)
+- [x] LICENSE, `.gitignore` runtime artifacts, GitHub Actions CI
+- [x] Real unit + OSC client tests (not only source contracts)
+- [x] Safer defaults: `operator` role, scaffolds off
 
 ## Phase 1 - Core reliability and observability
 
